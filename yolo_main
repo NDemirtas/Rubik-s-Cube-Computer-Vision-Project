@@ -1,0 +1,42 @@
+import cv2
+import glob
+from ultralytics import YOLO
+
+# 2. Find and load your latest best weights for auto-labeling
+weights_search = glob.glob("runs/detect/*/weights/best.pt")
+if weights_search:
+    MODEL_PATH = sorted(weights_search)[-1]  # Selects latest training run
+    print(f"Loading model weights from: {MODEL_PATH}")
+else:
+    print("Warning: Could not find custom weights, defaulting to baseline 'yolov8n.pt'")
+    MODEL_PATH = "yolov8n.pt"
+
+model = YOLO(MODEL_PATH)
+
+
+cap = cv2.VideoCapture(1)
+
+print("Starting live Rubik's Cube YOLO detector. Press 'q' to quit.")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+
+    # Run inference on Apple Silicon GPU
+    results = model(frame, device="mps", conf=0.4, verbose=False)
+
+    # Draw bounding boxes and labels onto the live video frame
+    annotated_frame = results[0].plot()
+
+    cv2.imshow("Custom YOLO Rubik's Cube Detector", annotated_frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+
+

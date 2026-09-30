@@ -1,0 +1,310 @@
+import cv2
+import glob
+import numpy as np
+from ultralytics import YOLO
+
+# --- HSV COLOR CALIBRATION ---
+COLOR_RANGES_HSV = {
+    'Red':    [((0, 120, 70), (10, 255, 255)), ((170, 120, 70), (180, 255, 255))],
+    'Orange': [((11, 120, 70), (25, 255, 255))],
+    'Yellow': [((26, 100, 100), (35, 255, 255))],
+    'Green':  [((36, 100, 80), (85, 255, 255))],
+    'Blue':   [((86, 100, 80), (125, 255, 255))],
+    'White':  [((0, 0, 150), (180, 45, 255))]
+}
+
+DRAW_COLORS = {
+    'White': (255, 255, 255), 'Yellow': (0, 255, 255), 'Red': (0, 0, 255),
+    'Orange': (0, 165, 255),  'Blue': (255, 0, 0),   'Green': (0, 255, 0),
+    'Unknown': (128, 128, 128)
+}
+
+smoothed_faces = {}
+
+
+def detect_stickers_in_roi(roi, offset_x, offset_y):
+    """Detects clean individual facelet centroids using CLAHE and minEnclosingCircle."""
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    v = clahe.apply(v)
+    hsv = cv2.merge([h, s, v])
+
+    stickers = []
+    for color_name, ranges in COLOR_RANGES_HSV.items():
+        color_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for (lower, upper) in ranges:
+            mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+            color_mask = cv2.bitwise_or(color_mask, mask)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_ERODE, kernel, iterations=1)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_DILATE, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if 120 < area < 15000:
+                peri = cv2.arcLength(cnt, True)
+                approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+
+                if 4 <= len(approx) <= 8:
+                    rect = cv2.minAreaRect(cnt)
+                    w, h = rect[1]
+                    if w > 0 and h > 0:
+                        aspect_ratio = max(w, h) / min(w, h)
+                        if aspect_ratio < 2.2:
+                            (cx_float, cy_float), _ = cv2.minEnclosingCircle(cnt)
+                            cx = int(cx_float) + offset_x
+                            cy = int(cy_float) + offset_y
+                            
+                            stickers.append({
+                                'center': np.array([cx, cy], dtype=np.float32),
+                                'color': color_name
+                            })
+    return stickers
+
+
+def group_stickers_into_faces(stickers, max_faces=3):
+    """Groups detected dots into face clusters using distance graph adjacency."""
+    if len(stickers) < 4:
+        return []
+
+    pts = np.array([s['center'] for s in stickers], dtype=np.float32)
+    n = len(pts)
+
+    # 1. Find nearest-neighbor distances to determine facelet pitch
+    dists = []
+    for i in range(n):
+        d = np.linalg.norm(pts - pts[i], axis=1)
+        d_sorted = np.sort(d)
+        if len(d_sorted) > 1:
+            dists.append(d_sorted[1])
+
+    if not dists:
+        return []
+
+    median_pitch = np.median(dists)
+    max_connection_dist = median_pitch * 2.4
+
+    # 2. Build adjacency matrix
+    adj = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if np.linalg.norm(pts[i] - pts[j]) < max_connection_dist:
+                adj[i, j] = True
+                adj[j, i] = True
+
+    # 3. Extract connected components
+    visited = np.zeros(n, dtype=bool)
+    clusters = []
+
+    for i in range(n):
+        if not visited[i]:
+            component = []
+            queue = [i]
+            visited[i] = True
+            while queue:
+                curr = queue.pop(0)
+                component.append(curr)
+                neighbors = np.where(adj[curr] & ~visited)[0]
+                for neighbor in neighbors:
+                    visited[neighbor] = True
+                    queue.append(neighbor)
+            
+            if len(component) >= 4:  # At least 4 dots needed to register a face
+                clusters.append([stickers[idx] for idx in component])
+
+    # Sort clusters by size (largest face first) and take up to max_faces
+    clusters.sort(key=lambda c: len(c), reverse=True)
+    return clusters[:max_faces]
+
+
+def build_robust_3x3_grid(face_stickers):
+    """
+    Fits a rotated bounding box and expands it to a full 3x3 span 
+    if fingers/glare block edge dots.
+    """
+    pts = np.array([s['center'] for s in face_stickers], dtype=np.float32)
+    
+    # 1. Estimate average spacing between adjacent dots
+    dists = []
+    for p in pts:
+        d = np.linalg.norm(pts - p, axis=1)
+        d_sorted = np.sort(d)
+        if len(d_sorted) > 1:
+            dists.append(d_sorted[1])
+    pitch = np.median(dists) if len(dists) > 0 else 30.0
+
+    # 2. Minimum Area Rotated Rectangle
+    rect = cv2.minAreaRect(pts)
+    (cx, cy), (w, h), angle = rect
+
+    # 3. If missing outer dots due to fingers, expand box dimensions to full 3x3 (2 * pitch)
+    target_span = pitch * 2.0
+    w_fit = max(w, target_span)
+    h_fit = max(h, target_span)
+
+    expanded_rect = ((cx, cy), (w_fit, h_fit), angle)
+    box_pts = cv2.boxPoints(expanded_rect)
+    ordered_quad = order_quad_points(box_pts)
+
+    # 4. Interpolate 9 grid centers evenly across the quad
+    top_left, top_right, bot_right, bot_left = ordered_quad
+    grid_9_pts = []
+
+    for r in range(3):
+        v = (r + 0.5) / 3.0  # 0.166, 0.5, 0.833
+        left_p = (1 - v) * top_left + v * bot_left
+        right_p = (1 - v) * top_right + v * bot_right
+        for c in range(3):
+            u = (c + 0.5) / 3.0
+            pt = (1 - u) * left_p + u * right_p
+            grid_9_pts.append(pt)
+
+    return np.array(grid_9_pts, dtype=np.float32), ordered_quad
+
+
+def order_quad_points(pts):
+    pts = pts.reshape((4, 2))
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+def process_face_quad(frame, quad_pts, face_idx, warp_size=240):
+    dst_pts = np.float32([[0, 0], [warp_size, 0], [warp_size, warp_size], [0, warp_size]])
+    M = cv2.getPerspectiveTransform(quad_pts.astype(np.float32), dst_pts)
+    flat_face = cv2.warpPerspective(frame, M, (warp_size, warp_size))
+    hsv_face = cv2.cvtColor(flat_face, cv2.COLOR_BGR2HSV)
+
+    cell_size = warp_size // 3
+    margin = int(cell_size * 0.25)
+
+    for r in range(3):
+        for c in range(3):
+            x_start, y_start = c * cell_size, r * cell_size
+            patch = hsv_face[y_start + margin : y_start + cell_size - margin, x_start + margin : x_start + cell_size - margin]
+
+            max_px = 0
+            best_col = 'Unknown'
+            for col_name, ranges in COLOR_RANGES_HSV.items():
+                mask = np.zeros(patch.shape[:2], dtype=np.uint8)
+                for (l, u) in ranges:
+                    mask = cv2.bitwise_or(mask, cv2.inRange(patch, np.array(l), np.array(u)))
+                cnt = cv2.countNonZero(mask)
+                if cnt > max_px:
+                    max_px = cnt
+                    best_col = col_name
+
+            draw_bgr = DRAW_COLORS.get(best_col, (128, 128, 128))
+            cv2.rectangle(flat_face, (x_start, y_start), (x_start + cell_size, y_start + cell_size), (0, 255, 0), 1)
+            cv2.putText(flat_face, best_col[0], (x_start + (cell_size // 2) - 10, y_start + (cell_size // 2) + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, draw_bgr, 2)
+
+    cv2.putText(flat_face, f"FACE {face_idx + 1}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    return flat_face
+
+
+# --- MAIN CAMERA LOOP ---
+weights = glob.glob("runs/detect/*/weights/best.pt") + glob.glob("runs/pose/*/weights/best.pt")
+model = YOLO(weights[-1] if weights else "yolov8n.pt")
+
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(1)
+
+is_paused = False
+last_annotated_frame = None
+last_combined_views = None
+
+print("\n--- STABLE ADAPTIVE GRID DETECTOR ---")
+print("Press SPACEBAR : Pause / Resume Live Feed")
+print("Press 'q'      : Quit Program\n")
+
+while True:
+    if not is_paused:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1)
+        h_frame, w_frame, _ = frame.shape
+        annotated_frame = frame.copy()
+
+        results = model(frame, conf=0.30, verbose=False)
+        boxes = results[0].boxes
+
+        warped_faces = []
+
+        if len(boxes) > 0:
+            box_areas = [(b.xyxy[0][2] - b.xyxy[0][0]) * (b.xyxy[0][3] - b.xyxy[0][1]) for b in boxes]
+            best_box = boxes[np.argmax(box_areas)].xyxy[0].cpu().numpy().astype(int)
+
+            pad = 15
+            x1 = max(0, best_box[0] - pad)
+            y1 = max(0, best_box[1] - pad)
+            x2 = min(w_frame, best_box[2] + pad)
+            y2 = min(h_frame, best_box[3] + pad)
+
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (255, 165, 0), 2)
+
+            roi = frame[y1:y2, x1:x2]
+            stickers = detect_stickers_in_roi(roi, offset_x=x1, offset_y=y1)
+
+            # Draw raw detected dots (Yellow)
+            for s in stickers:
+                cx, cy = int(s['center'][0]), int(s['center'][1])
+                cv2.circle(annotated_frame, (cx, cy), 3, (0, 255, 255), -1)
+
+            # Group stickers into 1 to 3 face clusters
+            face_clusters = group_stickers_into_faces(stickers, max_faces=3)
+            current_face_ids = set()
+
+            for i, face_stickers in enumerate(face_clusters):
+                current_face_ids.add(i)
+
+                # Generate robust 9-point grid and bounding quad
+                grid_9_pts, quad_corners = build_robust_3x3_grid(face_stickers)
+
+                # Draw predicted 9 grid centers (Magenta)
+                for pt in grid_9_pts:
+                    cv2.circle(annotated_frame, (int(pt[0]), int(pt[1])), 4, (255, 0, 255), -1)
+
+                # Draw green face bounding box
+                cv2.polylines(annotated_frame, [quad_corners.astype(np.int32)], True, (0, 255, 0), 2)
+
+                flat_face_img = process_face_quad(frame, quad_corners, i)
+                warped_faces.append(flat_face_img)
+
+            stale_keys = [k for k in smoothed_faces.keys() if k not in current_face_ids]
+            for k in stale_keys:
+                del smoothed_faces[k]
+        else:
+            smoothed_faces.clear()
+
+        last_combined_views = np.hstack(warped_faces) if len(warped_faces) > 0 else None
+        last_annotated_frame = annotated_frame
+
+    display_frame = last_annotated_frame.copy() if last_annotated_frame is not None else frame
+    if is_paused:
+        cv2.putText(display_frame, "PAUSED (Press SPACEBAR)", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
+
+    cv2.imshow("Stable Adaptive Grid Detector", display_frame)
+    if last_combined_views is not None:
+        cv2.imshow("Warped Face Views (1-3)", last_combined_views)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord(' '):
+        is_paused = not is_paused
+    elif key == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

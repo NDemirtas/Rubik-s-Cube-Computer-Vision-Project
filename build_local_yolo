@@ -1,0 +1,57 @@
+import os
+import cv2
+
+DATASET_DIR = "my_yolo_dataset"
+
+# 1. Create clean folder structure
+for split in ["train", "val"]:
+    os.makedirs(f"{DATASET_DIR}/images/{split}", exist_ok=True)
+    os.makedirs(f"{DATASET_DIR}/labels/{split}", exist_ok=True)
+
+# 2. Write correct data.yaml (path is absolute root, train/val are RELATIVE)
+abs_dataset_path = os.path.abspath(DATASET_DIR)
+yaml_content = f"""path: {abs_dataset_path}
+train: images/train
+val: images/val
+
+names:
+  0: rubiks_cube
+"""
+
+with open(f"{DATASET_DIR}/data.yaml", "w") as f:
+    f.write(yaml_content)
+
+print(f"Created YAML config at: {abs_dataset_path}/data.yaml")
+print("Opening camera to capture 25 quick training frames...")
+
+cap = cv2.VideoCapture(0)
+count = 0
+
+while count < 25:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+
+    # 80% train, 20% validation split
+    split = "train" if count < 20 else "val"
+
+    img_name = f"frame_{count}.jpg"
+    lbl_name = f"frame_{count}.txt"
+
+    img_path = os.path.join(DATASET_DIR, f"images/{split}", img_name)
+    lbl_path = os.path.join(DATASET_DIR, f"labels/{split}", lbl_name)
+
+    # Save frame image
+    cv2.imwrite(img_path, frame)
+
+    # Save initial bounding box annotation [class x_center y_center width height]
+    with open(lbl_path, "w") as f:
+        f.write("0 0.5 0.5 0.4 0.4\n")
+
+    count += 1
+    print(f"Saved [{split}] image {count}/25")
+
+cap.release()
+print("\nDataset generation finished!")

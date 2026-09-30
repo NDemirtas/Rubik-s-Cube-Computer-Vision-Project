@@ -1,0 +1,190 @@
+import cv2
+import glob
+import numpy as np
+from ultralytics import YOLO
+
+# --- 1. HSV COLOR CALIBRATION ---
+COLOR_RANGES_HSV = {
+    'Red':    [((0, 120, 70), (10, 255, 255)), ((170, 120, 70), (180, 255, 255))],
+    'Orange': [((11, 120, 70), (25, 255, 255))],
+    'Yellow': [((26, 100, 100), (35, 255, 255))],
+    'Green':  [((36, 100, 80), (85, 255, 255))],
+    'Blue':   [((86, 100, 80), (125, 255, 255))],
+    'White':  [((0, 0, 160), (180, 50, 255))]
+}
+
+DRAW_COLORS = {
+    'White': (255, 255, 255), 'Yellow': (0, 255, 255), 'Red': (0, 0, 255),
+    'Orange': (0, 165, 255),  'Blue': (255, 0, 0),   'Green': (0, 255, 0),
+    'Unknown': (128, 128, 128)
+}
+
+def identify_color(hsv_patch):
+    """Determines dominant color in an HSV crop."""
+    max_pixels = 0
+    best_color = 'Unknown'
+    for color_name, ranges in COLOR_RANGES_HSV.items():
+        total_mask = np.zeros(hsv_patch.shape[:2], dtype=np.uint8)
+        for (lower, upper) in ranges:
+            mask = cv2.inRange(hsv_patch, np.array(lower), np.array(upper))
+            total_mask = cv2.bitwise_or(total_mask, mask)
+            
+        count = cv2.countNonZero(total_mask)
+        if count > max_pixels:
+            max_pixels = count
+            best_color = color_name
+    return best_color
+
+
+def process_face_quad(frame, quad_pts, face_name, warp_size=240):
+    """Warps an angled 4-point quadrilateral into a flat 3x3 square grid with color detection."""
+    dst_pts = np.float32([
+        [0, 0], [warp_size, 0], 
+        [warp_size, warp_size], [0, warp_size]
+    ])
+
+    M = cv2.getPerspectiveTransform(quad_pts, dst_pts)
+    flat_face = cv2.warpPerspective(frame, M, (warp_size, warp_size))
+    hsv_face = cv2.cvtColor(flat_face, cv2.COLOR_BGR2HSV)
+
+    cell_size = warp_size // 3
+    margin = int(cell_size * 0.30)
+    grid_3x3 = []
+
+    for r in range(3):
+        row_colors = []
+        for c in range(3):
+            x_start, y_start = c * cell_size, r * cell_size
+            patch = hsv_face[
+                y_start + margin : y_start + cell_size - margin,
+                x_start + margin : x_start + cell_size - margin
+            ]
+
+            color = identify_color(patch)
+            row_colors.append(color)
+
+            # Draw HUD grid overlays
+            draw_bgr = DRAW_COLORS.get(color, (128, 128, 128))
+            cv2.rectangle(flat_face, (x_start, y_start), 
+                          (x_start + cell_size, y_start + cell_size), (0, 255, 0), 1)
+            cv2.putText(flat_face, color[0], (x_start + (cell_size // 2) - 10, y_start + (cell_size // 2) + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, draw_bgr, 2)
+
+        grid_3x3.append(row_colors)
+
+    # Title Banner
+    cv2.putText(flat_face, face_name, (10, 25), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    return flat_face, grid_3x3
+
+
+def synthesize_7_keypoints(pts):
+    """If fewer than 7 keypoints are returned, synthesizes a 3D center and edges."""
+    if len(pts) >= 7:
+        return pts[:7]
+    
+    # Fallback geometry if model returns 4-6 points
+    p0, p1, p2, p3 = pts[0], pts[1], pts[2], pts[3]
+    p4 = (p0 + p1 + p2 + p3) / 4.0  # Virtual center
+    p5 = (p2 + p3) / 2.0            # Virtual right
+    p6 = (p1 + p3) / 2.0            # Virtual bottom
+    return np.array([p0, p1, p2, p3, p4, p5, p6])
+
+
+# --- 2. INITIALIZE MODEL & CAMERA ---
+weights_search = glob.glob("runs/pose/*/weights/best.pt")
+MODEL_PATH = sorted(weights_search)[-1] if weights_search else "yolov8n-pose.pt"
+print(f"Loading model: {MODEL_PATH}")
+
+model = YOLO(MODEL_PATH)
+
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(1)
+
+# Control state
+is_paused = False
+last_annotated_frame = None
+last_combined_views = None
+
+print("\n--- CONTROLS ---")
+print("Press SPACEBAR : Pause / Resume Live Feed")
+print("Press 'q'      : Quit Program\n")
+
+
+# --- 3. MAIN LOOP ---
+while True:
+    if not is_paused:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to read camera feed.")
+            break
+
+        frame = cv2.flip(frame, 1)
+        annotated_frame = frame.copy()
+
+        # Run inference
+        results = model(frame, device="mps", conf=0.25, verbose=False)
+
+        if results[0].keypoints is not None and len(results[0].keypoints) > 0:
+            kpts_data = results[0].keypoints.xy.cpu().numpy()
+
+            for obj_kpts in kpts_data:
+                valid_pts = obj_kpts[obj_kpts.sum(axis=1) > 0]
+                if len(valid_pts) < 4:
+                    continue
+
+                # Ensure 7 keypoint locations
+                kpts7 = synthesize_7_keypoints(valid_pts)
+
+                # Draw 7 tracked points on main video feed
+                for pt in kpts7:
+                    cv2.circle(annotated_frame, (int(pt[0]), int(pt[1])), 5, (0, 255, 0), -1)
+
+                # Define the 3 face quads [UP, LEFT, RIGHT]
+                face_quad_indices = {
+                    '1: UP FACE':    [0, 2, 4, 1],  # [Top, Top-Right, Center, Top-Left]
+                    '2: LEFT FACE':  [1, 4, 6, 3],  # [Top-Left, Center, Bottom-Center, Bottom-Left]
+                    '3: RIGHT FACE': [4, 2, 5, 6]   # [Center, Top-Right, Bottom-Right, Bottom-Center]
+                }
+
+                warped_faces = []
+
+                # Extract and warp all 3 faces
+                for face_name, idxs in face_quad_indices.items():
+                    quad_pts = np.float32([kpts7[i] for i in idxs])
+                    
+                    # Draw polygon outlines on webcam feed
+                    cv2.polylines(annotated_frame, [quad_pts.astype(np.int32)], True, (255, 105, 180), 2)
+                    
+                    # Process and warp individual 3x3 face
+                    flat_face_img, _ = process_face_quad(frame, quad_pts, face_name)
+                    warped_faces.append(flat_face_img)
+
+                # Combine the 3 flattened face windows horizontally into a single image
+                if len(warped_faces) == 3:
+                    last_combined_views = np.hstack(warped_faces)
+
+        last_annotated_frame = annotated_frame
+
+    # Prepare display overlay
+    display_frame = last_annotated_frame.copy() if last_annotated_frame is not None else frame
+    if is_paused:
+        cv2.putText(display_frame, "PAUSED (Press SPACEBAR to resume)", (20, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
+
+    # Render Main Windows
+    cv2.imshow("Custom YOLOv8 3D Pose Feed", display_frame)
+    if last_combined_views is not None:
+        cv2.imshow("Warped 3-Face Extraction (UP | LEFT | RIGHT)", last_combined_views)
+
+    # --- KEYBOARD CONTROLS ---
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord(' '):  # SPACEBAR toggles Freeze Frame
+        is_paused = not is_paused
+        print("PAUSED" if is_paused else "RESUMED")
+    elif key == ord('q'):  # Quit
+        break
+
+cap.release()
+cv2.destroyAllWindows()

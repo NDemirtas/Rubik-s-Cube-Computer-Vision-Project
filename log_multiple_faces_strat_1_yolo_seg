@@ -1,0 +1,595 @@
+import cv2
+import glob
+import time
+import numpy as np
+from ultralytics import YOLO
+
+# --- CAMERA INITIALIZATION ---
+cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
+
+# # --- LOAD YOLOV8 MODEL ---
+# weights_search = glob.glob("runs/detect/*/weights/best.pt") + glob.glob("runs/pose/*/weights/best.pt")
+# MODEL_PATH = sorted(weights_search)[-1] if weights_search else "yolov8n.pt"
+# model = YOLO(MODEL_PATH)
+
+# --- LOAD YOLOV8 SEGMENTATION MODEL ---
+weights_search = glob.glob("runs/segment/*/weights/best.pt")
+MODEL_PATH = sorted(weights_search)[-1] if weights_search else "yolov8n-seg.pt"
+model = YOLO(MODEL_PATH)
+
+
+# --- REFINED HSV COLOR BOUNDS ---
+COLOR_RANGES_HSV = {
+    'Red':    [((0, 150, 60), (6, 255, 255)), ((168, 150, 60), (180, 255, 255))],
+    'Orange': [((7, 140, 60), (22, 255, 255))],
+    'Yellow': [((23, 80, 100), (38, 255, 255))],
+    'Green':  [((39, 80, 60), (85, 255, 255))],
+    'Blue':   [((86, 80, 60), (125, 255, 255))],
+    'White':  [((0, 0, 150), (180, 60, 255))]
+}
+
+DRAW_COLORS = {
+    'White': (255, 255, 255), 'Yellow': (0, 255, 255), 'Red': (0, 0, 255),
+    'Orange': (0, 165, 255),  'Blue': (255, 0, 0),   'Green': (0, 255, 0),
+    'Unknown': (128, 128, 128)
+}
+
+# --- GLOBAL STATE TRACKING ---
+VALID_COLORS = ['White', 'Yellow', 'Red', 'Orange', 'Green', 'Blue']
+
+# Pre-initialize centers permanently ([1][1] is pre-filled for each face)
+CUBE_STATE = {
+    col: [
+        ['Unknown', 'Unknown', 'Unknown'],
+        ['Unknown', col,       'Unknown'],
+        ['Unknown', 'Unknown', 'Unknown']
+    ] for col in VALID_COLORS
+}
+
+CUBE_VOTES = {
+    col: [[[] for _ in range(3)] for _ in range(3)] for col in VALID_COLORS
+}
+
+CURRENT_CENTER = None
+VOTE_WINDOW_SIZE = 4
+last_auto_process_time = 0.0
+AUTO_PROCESS_INTERVAL = 0.15
+
+def count_all_colors():
+    """Counts current total instances of each color logged across all 6 faces."""
+    counts = {col: 0 for col in VALID_COLORS}
+    for center, grid in CUBE_STATE.items():
+        for r in range(3):
+            for c in range(3):
+                col = grid[r][c]
+                if col in counts:
+                    counts[col] += 1
+    return counts
+
+
+def run_predictive_deduction():
+    """Applies count constraints and infers missing facelets by process of elimination."""
+    counts = count_all_colors()
+    
+    # 1. DEDUCT LAST MISSING COLOR(S) GLOBALLY
+    total_logged = sum(counts.values())
+    missing_colors = [col for col, qty in counts.items() if qty < 9]
+
+    # If only 1 color is under-represented and total logged is high, fill remaining Unknowns
+    if len(missing_colors) == 1:
+        needed_color = missing_colors[0]
+        for center, grid in CUBE_STATE.items():
+            for r in range(3):
+                for c in range(3):
+                    if grid[r][c] in ['Unknown', 'Obstructed'] and counts[needed_color] < 9:
+                        grid[r][c] = needed_color
+                        counts[needed_color] += 1
+
+    # 2. LOCAL FACE DEDUCTION (If a single face has 1 missing slot & 1 valid candidate left)
+    for center, grid in CUBE_STATE.items():
+        unknown_coords = []
+        for r in range(3):
+            for c in range(3):
+                if grid[r][c] in ['Unknown', 'Obstructed']:
+                    unknown_coords.append((r, c))
+
+        if len(unknown_coords) == 1:
+            r, c = unknown_coords[0]
+            # Find candidate colors that still need facelets globally
+            available = [col for col, qty in counts.items() if qty < 9]
+            if len(available) == 1:
+                grid[r][c] = available[0]
+                counts[available[0]] += 1
+
+def order_quad_points(pts):
+    pts = pts.reshape((4, 2))
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+    pts = np.array([s['center'] for s in cluster_stickers], dtype=np.float32)
+    sizes = [s['size'] for s in cluster_stickers]
+    single_s = np.median(sizes) if len(sizes) > 0 else 30.0
+
+    clean_angles = []
+    for s in cluster_stickers:
+        ang = s['angle']
+        if ang < -45: ang += 90
+        if abs(ang) < 15: ang = 0.0
+        clean_angles.append(ang)
+
+    median_angle_deg = np.median(clean_angles) if len(clean_angles) > 0 else 0.0
+    angle_rad = np.radians(median_angle_deg)
+
+    u_vec = np.array([np.cos(angle_rad), np.sin(angle_rad)], dtype=np.float32)
+    v_vec = np.array([-np.sin(angle_rad), np.cos(angle_rad)], dtype=np.float32)
+
+    proj_u = np.array([np.dot(p, u_vec) for p in pts])
+    proj_v = np.array([np.dot(p, v_vec) for p in pts])
+
+    pitch = single_s * 1.30
+
+    min_u, min_v = np.min(proj_u), np.min(proj_v)
+    u_indices = np.round((proj_u - min_u) / pitch).astype(int)
+    v_indices = np.round((proj_v - min_v) / pitch).astype(int)
+
+    u_cols, v_rows = set(u_indices), set(v_indices)
+
+    if 0 in u_cols and 1 in u_cols and 2 not in u_cols:
+        u_start = min_u - (single_s * 0.5)
+        u_end   = u_start + (3.0 * pitch)
+    else:
+        u_start = min_u - (single_s * 0.5)
+        u_end   = max(np.max(proj_u) + (single_s * 0.5), u_start + (3.0 * pitch))
+
+    if 0 in v_rows and 1 in v_rows and 2 in v_rows:
+        v_start = min_v - (single_s * 0.5)
+        v_end   = np.max(proj_v[v_indices == 2]) + (single_s * 0.5)
+    else:
+        v_start = min_v - (single_s * 0.5)
+        v_end   = v_start + (3.0 * pitch)
+
+    corner_tl = (u_start * u_vec) + (v_start * v_vec)
+    corner_tr = (u_end   * u_vec) + (v_start * v_vec)
+    corner_br = (u_end   * u_vec) + (v_end   * v_vec)
+    corner_bl = (u_start * u_vec) + (v_end   * v_vec)
+
+    return order_quad_points(np.array([corner_tl, corner_tr, corner_br, corner_bl], dtype=np.float32))
+
+def get_skin_mask(bgr_patch):
+    ycbcr = cv2.cvtColor(bgr_patch, cv2.COLOR_BGR2YCrCb)
+    lower_skin = np.array([0, 130, 75], dtype=np.uint8)
+    upper_skin = np.array([255, 175, 130], dtype=np.uint8)
+    return cv2.inRange(ycbcr, lower_skin, upper_skin)
+
+
+def check_patch_texture_and_variance(bgr_patch):
+    std_dev_bgr = np.std(bgr_patch, axis=(0, 1))
+    avg_std_dev = np.mean(std_dev_bgr)
+    gray_patch = cv2.cvtColor(bgr_patch, cv2.COLOR_BGR2GRAY)
+    laplacian_var = cv2.Laplacian(gray_patch, cv2.CV_64F).var()
+    return avg_std_dev, laplacian_var
+
+
+def flip_matrix_horizontal(matrix):
+    return [row[::-1] for row in matrix]
+
+
+def rotate_matrix_90_cw(matrix):
+    return [list(row) for row in zip(*matrix[::-1])]
+
+
+def get_matrix_rotations(matrix):
+    r0 = matrix
+    r90 = rotate_matrix_90_cw(r0)
+    r180 = rotate_matrix_90_cw(r90)
+    r270 = rotate_matrix_90_cw(r180)
+    return [r0, r90, r180, r270]
+
+
+def resolve_cube_state_from_votes():
+    global CUBE_STATE
+
+    candidate_grid = {col: [['Unknown']*3 for _ in range(3)] for col in CUBE_STATE}
+    
+    for center, grid_votes in CUBE_VOTES.items():
+        for r in range(3):
+            for c in range(3):
+                if r == 1 and c == 1:
+                    continue  # Skip center tile
+                valid_votes = [v for v in grid_votes[r][c] if v in VALID_COLORS]
+                if valid_votes:
+                    counts = {v: valid_votes.count(v) for v in set(valid_votes)}
+                    sorted_candidates = sorted(counts.keys(), key=lambda k: counts[k], reverse=True)
+                    candidate_grid[center][r][c] = sorted_candidates
+
+    # Centers already account for 1 of each color (6 total)
+    global_counts = {col: 1 for col in VALID_COLORS}
+    new_state = {
+        col: [
+            ['Unknown', 'Unknown', 'Unknown'],
+            ['Unknown', col,       'Unknown'],
+            ['Unknown', 'Unknown', 'Unknown']
+        ] for col in VALID_COLORS
+    }
+
+    for center in CUBE_STATE:
+        for r in range(3):
+            for c in range(3):
+                if r == 1 and c == 1:
+                    continue  # Center remains locked
+                
+                candidates = candidate_grid[center][r][c]
+                chosen_color = 'Unknown'
+
+                if isinstance(candidates, list):
+                    for cand in candidates:
+                        if global_counts[cand] < 9:
+                            chosen_color = cand
+                            global_counts[cand] += 1
+                            break
+
+                new_state[center][r][c] = chosen_color
+
+    CUBE_STATE = new_state
+    run_predictive_deduction()
+
+
+def auto_align_and_merge(scanned_grid):
+    global CUBE_STATE, CUBE_VOTES, CURRENT_CENTER
+    
+    # Read the center color strictly as the Face ID
+    center_color = scanned_grid[1][1]
+    if center_color not in CUBE_STATE or center_color in ['Unknown', 'Obstructed']:
+        return
+
+    if CURRENT_CENTER != center_color:
+        CURRENT_CENTER = center_color
+        for r in range(3):
+            for c in range(3):
+                if r == 1 and c == 1:
+                    continue
+                if len(CUBE_VOTES[center_color][r][c]) > 0:
+                    CUBE_VOTES[center_color][r][c] = CUBE_VOTES[center_color][r][c][-1:]
+
+    master_grid = CUBE_STATE[center_color]
+
+    known_outer_facelets = sum(
+        1 for r in range(3) for c in range(3) 
+        if (r != 1 or c != 1) and master_grid[r][c] not in ['Unknown', 'Obstructed']
+    )
+
+    best_scanned_rot = scanned_grid
+    
+    if known_outer_facelets > 0:
+        rotations = get_matrix_rotations(scanned_grid)
+        best_score = -999
+        
+        for rot in rotations:
+            score = 0
+            for r in range(3):
+                for c in range(3):
+                    if r == 1 and c == 1:
+                        continue  # Do not score against center
+                    m_val = master_grid[r][c]
+                    s_val = rot[r][c]
+                    if m_val not in ['Unknown', 'Obstructed'] and s_val not in ['Unknown', 'Obstructed']:
+                        if m_val == s_val:
+                            score += 2
+                        else:
+                            score -= 3
+            
+            if score > best_score:
+                best_score = score
+                best_scanned_rot = rot
+
+    # Push outer facelet detections into voting buffers
+    for r in range(3):
+        for c in range(3):
+            if r == 1 and c == 1:
+                continue  # Never write votes for the center tile
+            new_val = best_scanned_rot[r][c]
+            if new_val in VALID_COLORS:
+                history = CUBE_VOTES[center_color][r][c]
+                history.append(new_val)
+                if len(history) > VOTE_WINDOW_SIZE:
+                    history.pop(0)
+
+    resolve_cube_state_from_votes()
+
+
+def run_predictive_deduction():
+    """Predicts missing/obstructed slots when total colors near completion."""
+    counts = {col: 0 for col in VALID_COLORS}
+    for center, grid in CUBE_STATE.items():
+        for r in range(3):
+            for c in range(3):
+                if grid[r][c] in counts:
+                    counts[grid[r][c]] += 1
+
+    missing_colors = [col for col, qty in counts.items() if qty < 9]
+
+    # Global Deduction: If 53/54 facelets logged, remaining Unknowns MUST be the last missing color
+    if len(missing_colors) == 1:
+        needed_color = missing_colors[0]
+        for center, grid in CUBE_STATE.items():
+            for r in range(3):
+                for c in range(3):
+                    if grid[r][c] in ['Unknown', 'Obstructed'] and counts[needed_color] < 9:
+                        grid[r][c] = needed_color
+                        counts[needed_color] += 1
+
+
+def render_logged_face_window(face_size=120):
+    cell_size = face_size // 3
+    canvas_w = face_size * 4
+    canvas_h = face_size * 3
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+
+    LAYOUT_MAP = {
+        'White':  (1, 0),
+        'Orange': (0, 1),
+        'Green':  (1, 1),
+        'Red':    (2, 1),
+        'Blue':   (3, 1),
+        'Yellow': (1, 2)
+    }
+
+    for center_color, (grid_col, grid_row) in LAYOUT_MAP.items():
+        face_x = grid_col * face_size
+        face_y = grid_row * face_size
+        face_grid = CUBE_STATE[center_color]
+
+        cv2.rectangle(canvas, (face_x, face_y), (face_x + face_size, face_y + face_size), (150, 150, 150), 2)
+        
+        if CURRENT_CENTER == center_color:
+            cv2.rectangle(canvas, (face_x - 2, face_y - 2), (face_x + face_size + 2, face_y + face_size + 2), (0, 255, 255), 3)
+
+        for r in range(3):
+            for c in range(3):
+                color_name = face_grid[r][c]
+                x1 = face_x + (c * cell_size)
+                y1 = face_y + (r * cell_size)
+                x2 = x1 + cell_size
+                y2 = y1 + cell_size
+
+                if color_name in DRAW_COLORS and color_name != 'Unknown':
+                    fill_color = DRAW_COLORS[color_name]
+                    cv2.rectangle(canvas, (x1 + 3, y1 + 3), (x2 - 3, y2 - 3), fill_color, -1)
+                    text_color = (0, 0, 0) if color_name in ['White', 'Yellow'] else (255, 255, 255)
+                    display_char = color_name[0]
+                else:
+                    text_color = (180, 105, 255) if color_name == 'Obstructed' else (100, 100, 100)
+                    display_char = 'X' if color_name == 'Obstructed' else '?'
+
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), (60, 60, 60), 1)
+                cv2.putText(canvas, display_char, (x1 + (cell_size // 2) - 5, y1 + (cell_size // 2) + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1)
+
+    cv2.imshow("Cube Master State (6 Faces)", canvas)
+    cv2.moveWindow("Cube Master State (6 Faces)", 1000, 50)
+
+def split_mask_into_face_quads(mask_binary):
+    """Detects inner defect points on the YOLO mask boundary and partitions it into individual 4-corner face quads."""
+    contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+
+    cnt = max(contours, key=cv2.contourArea)
+    
+    # 1. Simplify contour to smooth out tiny edge noise
+    peri = cv2.arcLength(cnt, True)
+    approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+
+    # 2. If it's a simple 4-sided polygon, return as a single face
+    if len(approx) == 4:
+        return [order_quad_points(approx.reshape(4, 2))]
+
+    # 3. Find Convexity Defects (inward dips where visible faces intersect in 3D)
+    hull = cv2.convexHull(approx, returnPoints=False)
+    if hull is None or len(hull) < 3:
+        return [order_quad_points(cv2.boxPoints(cv2.minAreaRect(cnt)))]
+
+    defects = cv2.convexityDefects(approx, hull)
+    
+    # Extract defect points (deepest inward dips)
+    defect_pts = []
+    if defects is not None:
+        for i in range(defects.shape[0]):
+            s, e, f, d = defects[i, 0]
+            if d > 1000:  # Distance threshold for valid face boundary joint
+                defect_pts.append(approx[f][0])
+
+    # 4. Fallback: If no distinct 3D defects found, fall back to simple minimum area quad
+    if not defect_pts:
+        rect = cv2.minAreaRect(cnt)
+        return [order_quad_points(cv2.boxPoints(rect))]
+
+    # 5. Partition contour points around the center/defect points into sub-quads
+    # For a standard 2/3 face view, we approximate sub-quad regions around points
+    quads = []
+    approx_pts = approx.reshape(-1, 2)
+    center_pt = np.mean(defect_pts, axis=0) if len(defect_pts) > 0 else np.mean(approx_pts, axis=0)
+
+    # Split outer vertices relative to the 3D center junction
+    # (Divides polygon points into 4-point sub-quads sharing the center vertex)
+    num_pts = len(approx_pts)
+    step = max(1, num_pts // 3 if len(defect_pts) >= 2 else num_pts // 2)
+
+    for i in range(0, num_pts, step):
+        sub_pts = [center_pt]
+        for j in range(3):
+            sub_pts.append(approx_pts[(i + j) % num_pts])
+        
+        if len(sub_pts) == 4:
+            quads.append(order_quad_points(np.array(sub_pts, dtype=np.float32)))
+
+    return quads if len(quads) > 0 else [order_quad_points(cv2.boxPoints(cv2.minAreaRect(cnt)))]
+
+def sample_colors_inside_quad(photo_img, quad_pts, warp_size=240):
+    dst_pts = np.float32([[0, 0], [warp_size, 0], [warp_size, warp_size], [0, warp_size]])
+    M = cv2.getPerspectiveTransform(quad_pts.astype(np.float32), dst_pts)
+    flat_face = cv2.warpPerspective(photo_img, M, (warp_size, warp_size))
+    hsv_face = cv2.cvtColor(flat_face, cv2.COLOR_BGR2HSV)
+
+    cell_size = warp_size // 3
+    margin = int(cell_size * 0.35)
+
+    current_frame_grid = [['Unknown' for _ in range(3)] for _ in range(3)]
+
+    for r in range(3):
+        for c in range(3):
+            x_start, y_start = c * cell_size, r * cell_size
+            
+            bgr_patch = flat_face[
+                y_start + margin : y_start + cell_size - margin,
+                x_start + margin : x_start + cell_size - margin
+            ]
+            hsv_patch = hsv_face[
+                y_start + margin : y_start + cell_size - margin,
+                x_start + margin : x_start + cell_size - margin
+            ]
+
+            total_patch_pixels = bgr_patch.shape[0] * bgr_patch.shape[1]
+
+            white_mask = cv2.inRange(hsv_patch, np.array([0, 0, 150]), np.array([180, 60, 255]))
+            white_pixel_ratio = cv2.countNonZero(white_mask) / total_patch_pixels
+
+            if white_pixel_ratio > 0.50:
+                is_finger = False
+                candidate_color = 'White'
+            else:
+                skin_mask = get_skin_mask(bgr_patch)
+                skin_ratio = cv2.countNonZero(skin_mask) / total_patch_pixels
+                avg_std_dev, laplacian_var = check_patch_texture_and_variance(bgr_patch)
+                is_finger = (skin_ratio > 0.35) or (avg_std_dev > 45.0 and laplacian_var > 220.0)
+
+            if is_finger:
+                candidate_color = 'Obstructed'
+            elif white_pixel_ratio <= 0.50:
+                color_pixel_counts = {}
+                skin_mask = get_skin_mask(bgr_patch)
+
+                for col_name, ranges in COLOR_RANGES_HSV.items():
+                    mask = np.zeros(hsv_patch.shape[:2], dtype=np.uint8)
+                    for (lower, upper) in ranges:
+                        mask = cv2.bitwise_or(mask, cv2.inRange(hsv_patch, np.array(lower), np.array(upper)))
+                    
+                    clean_mask = cv2.bitwise_and(mask, cv2.bitwise_not(skin_mask))
+                    color_pixel_counts[col_name] = cv2.countNonZero(clean_mask)
+
+                candidate_color = max(color_pixel_counts, key=color_pixel_counts.get)
+                max_pixels = color_pixel_counts[candidate_color]
+
+                if (max_pixels / total_patch_pixels) < 0.15:
+                    candidate_color = 'Unknown'
+
+                if candidate_color in ['Red', 'Orange']:
+                    clean_hsv_patch = cv2.bitwise_and(hsv_patch, hsv_patch, mask=cv2.bitwise_not(skin_mask))
+                    hue_pixels = clean_hsv_patch[:, :, 0][clean_hsv_patch[:, :, 0] > 0]
+
+                    if len(hue_pixels) > 0:
+                        mean_hue = np.mean(hue_pixels)
+                        if 7.5 <= mean_hue <= 22.0:
+                            candidate_color = 'Orange'
+                        elif mean_hue < 7.5 or mean_hue > 165.0:
+                            candidate_color = 'Red'
+
+            current_frame_grid[r][c] = candidate_color
+
+            if candidate_color == 'Obstructed':
+                draw_bgr = (180, 105, 255)
+                display_char = 'X'
+            else:
+                draw_bgr = DRAW_COLORS.get(candidate_color, (128, 128, 128))
+                display_char = candidate_color[0]
+
+            cv2.rectangle(flat_face, (x_start, y_start), 
+                          (x_start + cell_size, y_start + cell_size), (0, 255, 0), 1)
+            cv2.putText(flat_face, display_char, 
+                        (x_start + (cell_size // 2) - 8, y_start + (cell_size // 2) + 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, draw_bgr, 2)
+
+    # Flip horizontally before merging
+    current_frame_grid = flip_matrix_horizontal(current_frame_grid)
+
+    auto_align_and_merge(current_frame_grid)
+    render_logged_face_window()
+
+    return flat_face
+
+
+# --- MAIN LOOP ---
+render_logged_face_window()
+cv2.namedWindow("Main Feed")
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+
+    frame = cv2.flip(frame, 1)
+    h_frame, w_frame, _ = frame.shape
+    display_frame = frame.copy()
+
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord('r'):
+        CURRENT_CENTER = None
+        CUBE_STATE = {
+            col: [
+                ['Unknown', 'Unknown', 'Unknown'],
+                ['Unknown', col,       'Unknown'],
+                ['Unknown', 'Unknown', 'Unknown']
+            ] for col in VALID_COLORS
+        }
+        CUBE_VOTES = {
+            col: [[[] for _ in range(3)] for _ in range(3)] for col in VALID_COLORS
+        }
+        render_logged_face_window()
+
+    elif key == ord('q'):
+        break
+
+# RUN YOLO SEGMENTATION AUTOMATICALLY
+    results = model(frame, device="mps", conf=0.40, verbose=False)[0]
+
+    if results.masks is not None and len(results.masks) > 0:
+        masks = results.masks.data.cpu().numpy()
+        boxes = results.boxes.xyxy.cpu().numpy().astype(int)
+        
+        best_idx = np.argmax([(b[2]-b[0])*(b[3]-b[1]) for b in boxes])
+        best_mask = masks[best_idx]
+
+        mask_resized = cv2.resize(best_mask, (w_frame, h_frame))
+        mask_binary = (mask_resized > 0.5).astype(np.uint8) * 255
+
+        # Split single mask into face quads
+        face_quads = split_mask_into_face_quads(mask_binary)
+
+        current_time = time.time()
+        if (current_time - last_auto_process_time) > AUTO_PROCESS_INTERVAL:
+            last_auto_process_time = current_time
+
+            for idx, quad in enumerate(face_quads):
+                # Sample colors for each detected face quad independently
+                warped_face = sample_colors_inside_quad(frame, quad)
+                
+                # Draw green boundaries for each detected face
+                cv2.polylines(display_frame, [quad.astype(np.int32)], True, (0, 255, 0), 2)
+                cv2.putText(display_frame, f"Face {idx+1}", (int(quad[0][0]), int(quad[0][1]) - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                
+                cv2.imshow(f"Warped Face {idx+1}", cv2.resize(warped_face, (180, 180)))
+
+    cv2.imshow("Main Feed", display_frame)
+
+cap.release()
+cv2.destroyAllWindows()

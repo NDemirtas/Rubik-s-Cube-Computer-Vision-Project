@@ -1,0 +1,94 @@
+import cv2
+import numpy as np
+
+def classify_hsv(h, s, v):
+    """Refined classification to separate Red and Orange cleanly."""
+    
+    # 1. White: low saturation, high brightness
+    if s < 60 and v > 120:
+        return "White"
+    
+    # 2. Yellow
+    if 21 <= h <= 35 and s > 80:
+        return "Yellow"
+    
+    # 3. Green
+    elif 36 <= h <= 85 and s > 70:
+        return "Green"
+    
+    # 4. Blue
+    elif 86 <= h <= 130 and s > 70:
+        return "Blue"
+    
+    # 5. ORANGE vs RED ADJUSTMENT:
+    # If Hue is between 7 and 22, it is Orange.
+    elif 4 <= h <= 22 and s > 90:
+        return "Orange"
+    
+    # Red ONLY takes 0 to 6 (and the top loop 168 to 180).
+    elif (0 <= h < 4 or 168 <= h <= 180) and s > 90:
+        return "Red"
+    
+    return "Unknown"
+
+cap = cv2.VideoCapture(0)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    height, width, _ = frame.shape
+
+    box_size = 300
+    start_x = (width - box_size) // 2
+    start_y = (height - box_size) // 2
+    cell_size = box_size // 3
+
+    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    for row in range(3):
+        for col in range(3):
+            x1 = start_x + col * cell_size
+            y1 = start_y + row * cell_size
+            x2 = x1 + cell_size
+            y2 = y1 + cell_size
+
+            cx = x1 + cell_size // 2
+            cy = y1 + cell_size // 2
+            
+            # Sample central area
+            sample_region = hsv_frame[cy-8:cy+8, cx-8:cx+8]
+            avg_hsv = sample_region.mean(axis=(0, 1))
+            h, s, v = int(avg_hsv[0]), int(avg_hsv[1]), int(avg_hsv[2])
+
+            color_name = classify_hsv(h, s, v)
+
+            # Draw cell outline and label (using first 2 letters)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 2)
+            cv2.circle(frame, (cx, cy), 4, (0, 0, 0), -1)
+            
+            # Draw label background box for better visibility
+            display_label = color_name[:2]  # e.g., 'Or', 'Rd', 'Wh', 'Un'
+            cv2.putText(frame, display_label, (x1 + 15, y1 + 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3)
+            cv2.putText(frame, display_label, (x1 + 15, y1 + 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1)
+
+    cv2.putText(frame, "Press 's' to print middle cell HSV, 'q' to quit", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.imshow("Rubik's Cube Face Detector", frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord('s'):
+        # Print the exact HSV reading of the center sticker
+        mid_cx = start_x + cell_size + cell_size // 2
+        mid_cy = start_y + cell_size + cell_size // 2
+        center_sample = hsv_frame[mid_cy-5:mid_cy+5, mid_cx-5:mid_cx+5].mean(axis=(0, 1))
+        print(f"Center Cell HSV -> H: {int(center_sample[0])}, S: {int(center_sample[1])}, V: {int(center_sample[2])}")
+
+cap.release()
+cv2.destroyAllWindows()

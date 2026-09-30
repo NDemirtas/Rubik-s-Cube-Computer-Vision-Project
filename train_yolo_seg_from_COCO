@@ -1,0 +1,43 @@
+import os
+import glob
+from ultralytics import YOLO
+from ultralytics.data.converter import convert_coco
+
+# 1. Folder downloaded by Roboflow
+COCO_DATASET_DIR = "Rubik's-Cube-Raghav-Dataset"  # Check exact folder name in terminal if different
+
+# 2. Convert COCO JSON annotations to YOLOv8 Segmentation TXT format
+print("Converting COCO JSON annotations to YOLO Segmentation format...")
+convert_coco(
+    labels_dir=os.path.join(COCO_DATASET_DIR, "train"),
+    use_segments=True  # Converts polygon masks instead of standard boxes
+)
+
+# 3. Locate the converted data.yaml
+data_yaml = os.path.abspath(os.path.join(COCO_DATASET_DIR, "yolo_labels", "data.yaml"))
+
+# 4. Clear cache files
+for c in glob.glob(f"{COCO_DATASET_DIR}/**/*.cache", recursive=True):
+    try:
+        os.remove(c)
+    except OSError:
+        pass
+
+# 5. Initialize base YOLOv8 Segmentation model
+model = YOLO("yolov8n-seg.pt")
+
+# 6. Train model on Apple Silicon GPU
+results = model.train(
+    data=data_yaml,
+    epochs=30,
+    imgsz=640,
+    batch=8,
+    device="mps",
+    single_cls=True,  # Restricts predictions strictly to your Rubik's cube class
+    project="runs/segment",
+    name="rubiks_seg_model",
+    exist_ok=True
+)
+
+print("\nTraining Complete!")
+print("Best segmentation weights saved to: runs/segment/rubiks_seg_model/weights/best.pt")

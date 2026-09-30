@@ -1,0 +1,89 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import torch
+import glob
+
+# 1. Automatically load your fine-tuned standard detection weights
+weights = sorted(glob.glob("runs/detect/*/weights/best.pt"))
+detect_weights = [w for w in weights if "obb" not in w]
+
+if detect_weights:
+    MODEL_PATH = detect_weights[-1]
+    print(f"✅ Loading fine-tuned weights: {MODEL_PATH}")
+else:
+    MODEL_PATH = "yolov8n.pt"
+    print("⚠️ Fine-tuned weights not found, falling back to standard yolov8n.pt")
+
+device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+model = YOLO(MODEL_PATH)
+
+def stage2_placeholder(cube_crop):
+    """
+    STUB FOR STAGE 2: 
+    Accepts the cropped BGR image of the cube from YOLO.
+    Returns processed output (e.g., facelet segmentation, 3D keypoints).
+    """
+    h, w, _ = cube_crop.shape
+    
+    # Visual placeholder showing where Stage 2 receives the crop
+    output = cube_crop.copy()
+    cv2.putText(
+        output, f"Stage 2 Input ({w}x{h})", 
+        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1
+    )
+    return output
+
+# --- LIVE CAMERA STREAM ---
+cap = cv2.VideoCapture(1)
+print("🎥 Running Stage 1 Cube Tracker... Press 'q' to quit.")
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # Run YOLO bounding box detection
+    results = model.predict(frame, conf=0.5, verbose=False, device=device)[0]
+    
+    # Process each detected cube
+    for box in results.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+        conf = float(box.conf[0])
+
+        # Ensure box coordinates stay inside frame boundaries
+        h_frame, w_frame, _ = frame.shape
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w_frame, x2), min(h_frame, y2)
+
+        # 1. DRAW STAGE 1 BOUNDING BOX
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 105, 180), 2)
+        cv2.putText(
+            frame, f"Rubik's Cube: {conf:.2f}", 
+            (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 
+            0.6, (255, 105, 180), 2
+        )
+
+        # 2. CROP REGION OF INTEREST (ROI) FOR STAGE 2
+        cube_roi = frame[y1:y2, x1:x2]
+
+        if cube_roi.size > 0:
+            # 3. HANDOFF TO STAGE 2
+            processed_roi = stage2_placeholder(cube_roi)
+
+            # Draw small live preview of the Stage 2 input in top-left corner
+            preview_h = 150
+            aspect_ratio = cube_roi.shape[1] / max(1, cube_roi.shape[0])
+            preview_w = int(preview_h * aspect_ratio)
+            
+            preview_resized = cv2.resize(processed_roi, (preview_w, preview_h))
+            frame[10:10 + preview_h, 10:10 + preview_w] = preview_resized
+            cv2.rectangle(frame, (10, 10), (10 + preview_w, 10 + preview_h), (0, 255, 0), 2)
+
+    cv2.imshow("Stage 1: Rubik's Cube Detection Pipeline", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

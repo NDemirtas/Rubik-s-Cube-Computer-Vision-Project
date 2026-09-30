@@ -1,0 +1,17 @@
+from ultralytics import YOLO
+
+# Load base nano pose model
+model = YOLO("yolov8n-pose.pt")
+
+results = model.train(
+    data="rubiks_dataset/data.yaml",
+    epochs=50,
+    # --- PERFORMANCE OPTIMIZATIONS ---
+    imgsz=320,  # Lower resolution (fast training & low memory)
+    batch=8,  # Lower batch size for Apple Silicon GPU
+    workers=2,  # Prevents CPU memory overhead
+    device="mps",  # Apple Silicon GPU acceleration
+    # --- SPEED TRICKS ---
+    cache=True,  # Keeps images in RAM to eliminate disk reads
+    val=True,  # Evaluates performance on the validation set after each epoch
+)

@@ -1,0 +1,18 @@
+import os
+
+# List of image index numbers that had bad detections/labels
+bad_indices = [42, 57, 89]  # Replace with the actual image numbers you want to remove
+
+IMG_DIR = "Rubik-s-Cube-Detection-1/train/images"
+LBL_DIR = "Rubik-s-Cube-Detection-1/train/labels"
+
+for idx in bad_indices:
+    img_path = os.path.join(IMG_DIR, f"hand_frame_{idx}.jpg")
+    lbl_path = os.path.join(LBL_DIR, f"hand_frame_{idx}.txt")
+    
+    if os.path.exists(img_path):
+        os.remove(img_path)
+    if os.path.exists(lbl_path):
+        os.remove(lbl_path)
+
+print(f"Removed {len(bad_indices)} bad image/label pairs!")

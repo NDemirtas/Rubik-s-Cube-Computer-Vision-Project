@@ -1,0 +1,7 @@
+path: ./dataset
+train: images/train
+val: images/val
+
+kpt_shape: [7, 3] # 4 keypoints per cube (x, y, visibility) 7 3D vertices
+names:
+  0: rubiks_cube

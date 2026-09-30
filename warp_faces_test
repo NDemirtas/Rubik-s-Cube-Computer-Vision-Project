@@ -1,0 +1,130 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import torch
+import glob
+
+# --- 1. FIND YOUR LATEST TRAINED MODEL ---
+# Automatically locates your newest trained best.pt
+weights_found = sorted(glob.glob("runs/detect/*/weights/best.pt"))
+if not weights_found:
+    print("Error: Could not find any trained weights in runs/detect/")
+    exit()
+
+YOLO_WEIGHTS_PATH = weights_found[-1]
+print(f"Loading standard YOLO model from: {YOLO_WEIGHTS_PATH}")
+
+SQUARE_SIZE = 180     # Thumbnail preview size in pixels
+CONF_THRESHOLD = 0.40 # Detection threshold
+
+device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+
+# --- 2. LOAD YOUR CUSTOM MODEL ---
+model = YOLO(YOLO_WEIGHTS_PATH)
+
+def crop_and_draw_grid(frame, bbox):
+    """
+    Crops the detected face bounding box, warps it to a square,
+    and draws the 3x3 sampling grid lines over it.
+    """
+    x1, y1, x2, y2 = bbox
+    
+    # 4 corners of standard bounding box
+    src_pts = np.float32([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
+    dst_pts = np.float32([[0, 0], [SQUARE_SIZE, 0], [SQUARE_SIZE, SQUARE_SIZE], [0, SQUARE_SIZE]])
+
+    # Perspective warp face into flat square
+    matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    warped = cv2.warpPerspective(frame, matrix, (SQUARE_SIZE, SQUARE_SIZE))
+
+    # Draw 3x3 Grid Lines (White)
+    patch_size = SQUARE_SIZE // 3
+    line_color = (255, 255, 255)
+    
+    # Vertical grid lines
+    cv2.line(warped, (patch_size, 0), (patch_size, SQUARE_SIZE), line_color, 2)
+    cv2.line(warped, (2 * patch_size, 0), (2 * patch_size, SQUARE_SIZE), line_color, 2)
+    # Horizontal grid lines
+    cv2.line(warped, (0, patch_size), (SQUARE_SIZE, patch_size), line_color, 2)
+    cv2.line(warped, (0, 2 * patch_size), (SQUARE_SIZE, 2 * patch_size), line_color, 2)
+
+    # Draw Inner Green Sampling Squares (Where Stage 2 reads pixel color)
+    margin = int(patch_size * 0.2)
+    for r in range(3):
+        for c in range(3):
+            py1, py2 = r * patch_size + margin, (r + 1) * patch_size - margin
+            px1, px2 = c * patch_size + margin, (c + 1) * patch_size - margin
+            cv2.rectangle(warped, (px1, py1), (px2, py2), (0, 255, 0), 1)
+
+    return warped
+
+def overlay_thumbnails_in_corner(main_frame, processed_faces):
+    """
+    Overlays 2D flat face thumbnails in the top-right corner.
+    """
+    canvas_h, canvas_w, _ = main_frame.shape
+    margin = 15
+    current_y = margin
+
+    for i, face_img in enumerate(processed_faces):
+        fh, fw, _ = face_img.shape
+        current_x = canvas_w - fw - margin
+
+        if current_y + fh + margin > canvas_h:
+            break
+
+        # Draw black background card behind thumbnail
+        cv2.rectangle(main_frame, 
+                      (current_x - 3, current_y - 20), 
+                      (current_x + fw + 3, current_y + fh + 3), 
+                      (0, 0, 0), -1)
+
+        # Label thumbnail
+        cv2.putText(main_frame, f"Face {i+1} Preview", 
+                    (current_x + 5, current_y - 5), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+        # Copy warped face onto camera stream
+        main_frame[current_y:current_y+fh, current_x:current_x+fw] = face_img
+        current_y += fh + 30
+
+# --- 3. LIVE WEBCAM LOOP ---
+cap = cv2.VideoCapture(0)
+
+print("Starting webcam... Press 'q' to quit.")
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # Run inference with YOUR trained model
+    results = model.predict(frame, conf=CONF_THRESHOLD, verbose=False, device=device)[0]
+
+    warped_thumbnails = []
+
+    # Loop through detected faces
+    for i, box in enumerate(results.boxes):
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+        conf = float(box.conf[0])
+
+        # Draw main 3D bounding box on camera feed
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(frame, f"Face {i+1} ({conf:.2f})", (x1, max(y1 - 10, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+        # Process flat 2D thumbnail preview
+        thumbnail = crop_and_draw_grid(frame, [x1, y1, x2, y2])
+        warped_thumbnails.append(thumbnail)
+
+    # Overlay thumbnails in corner
+    if warped_thumbnails:
+        overlay_thumbnails_in_corner(frame, warped_thumbnails)
+
+    cv2.imshow("Rubik's Face Detection HUD", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

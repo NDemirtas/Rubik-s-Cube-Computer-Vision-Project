@@ -1,0 +1,91 @@
+import cv2
+import numpy as np
+
+def detect_cube_facelets(frame):
+    """
+    Detects individual square facelets across the whole camera frame
+    and draws bounding boxes around them.
+    """
+    # 1. Preprocessing: Convert to grayscale and blur to remove noise
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # 2. Edge Detection: Adaptive thresholding handles changing light best
+    thresh = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY_INV, 11, 2
+    )
+
+    # 3. Find Contours (Outlines)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    valid_facelets = []
+
+    for cnt in contours:
+        # Calculate area filter (ignore tiny dots and huge background shapes)
+        area = cv2.contourArea(cnt)
+        if 400 < area < 25000:
+            
+            # Approximate shape to a polygon
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+
+            # A facelet sticker must have 4 corners
+            if len(approx) == 4:
+                x, y, w, h = cv2.boundingRect(approx)
+                
+                # Check aspect ratio (width vs height should be roughly 1:1)
+                aspect_ratio = float(w) / h
+                if 0.75 <= aspect_ratio <= 1.25:
+                    valid_facelets.append((x, y, w, h, cnt))
+
+    # Draw detected facelet squares
+    for x, y, w, h, cnt in valid_facelets:
+        # Draw green border around candidate stickers
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        
+        # Mark center point
+        cx, cy = x + w // 2, y + h // 2
+        cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+
+    # If 9 or more facelet candidates are detected, calculate overall cube bounding box
+    if len(valid_facelets) >= 9:
+        all_x = [x for x, y, w, h, _ in valid_facelets]
+        all_y = [y for x, y, w, h, _ in valid_facelets]
+        all_w = [w for x, y, w, h, _ in valid_facelets]
+        all_h = [h for x, y, w, h, _ in valid_facelets]
+
+        min_x = min(all_x)
+        min_y = min(all_y)
+        max_x = max([x + w for x, w in zip(all_x, all_w)])
+        max_y = max([y + h for y, h in zip(all_y, all_h)])
+
+        # Draw a thick blue bounding box around the whole detected cube face
+        cv2.rectangle(frame, (min_x - 10, min_y - 10), (max_x + 10, max_y + 10), (255, 0, 0), 3)
+        cv2.putText(frame, "CUBE DETECTED", (min_x - 10, min_y - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+
+    return frame, len(valid_facelets)
+
+# Run Video Loop
+cap = cv2.VideoCapture(0)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    processed_frame, count = detect_cube_facelets(frame)
+
+    # Display facelet count on screen
+    cv2.putText(processed_frame, f"Facelets Found: {count}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    cv2.imshow("Automatic Rubik's Cube Tracker", processed_frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

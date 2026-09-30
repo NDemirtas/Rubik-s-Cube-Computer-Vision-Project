@@ -1,0 +1,90 @@
+import cv2
+import os
+import time
+
+# --- Setup Saving Paths ---
+BASE_DIR = "dataset"
+CLASSES = ["white", "yellow", "green", "blue", "red", "orange", "background"]
+
+# Current target class index (starts at 0 -> 'white')
+current_class_idx = 0
+
+# Start Video Capture (0 or 1 for Continuity Camera)
+cap = cv2.VideoCapture(1)
+
+if not cap.isOpened():
+    print("Error: Camera could not be accessed.")
+    exit()
+
+print("=" * 60)
+print("RUBIK'S CUBE DATASET COLLECTOR")
+print("=" * 60)
+print("INSTRUCTIONS:")
+print("- Place a single facelet sticker (or background sample) inside the red center box.")
+print("- Press 'SPACE' to save a 32x32 crop image to the active class folder.")
+print("- Press 'n' to cycle to the next color/class.")
+print("- Press 'q' to quit.")
+print("=" * 60)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Failed to grab frame.")
+        break
+
+    frame = cv2.flip(frame, 1)
+    height, width, _ = frame.shape
+
+    # Define a 100x100 box in the center of the screen
+    box_size = 100
+    start_x = (width - box_size) // 2
+    start_y = (height - box_size) // 2
+    end_x = start_x + box_size
+    end_y = start_y + box_size
+
+    # Get the active class name
+    active_class = CLASSES[current_class_idx]
+    save_folder = os.path.join(BASE_DIR, active_class)
+
+    # Count existing images in current folder
+    existing_count = len([f for f in os.listdir(save_folder) if f.endswith('.png')])
+
+    # Extract the Center Region of Interest (ROI)
+    roi = frame[start_y:end_y, start_x:end_x]
+
+    # Draw bounding box and information on the video feed
+    cv2.rectangle(frame, (start_x, start_y), (end_x, end_y), (0, 0, 255), 2)
+    cv2.putText(frame, f"Active Class: [{active_class.upper()}]", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    cv2.putText(frame, f"Images Saved: {existing_count}", (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    cv2.putText(frame, "SPACE: Capture | 'n': Next Class | 'q': Quit", (20, height - 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+    cv2.imshow("Dataset Collector - CNN", frame)
+
+    key = cv2.waitKey(1) & 0xFF
+
+    # Press SPACEBAR to capture and save crop
+    if key == 32:  # ASCII 32 = Space
+        # Resize cropped region directly to 32x32 (Jay Hack CNN input size)
+        crop_32x32 = cv2.resize(roi, (32, 32), interpolation=cv2.INTER_AREA)
+
+        # Generate unique filename using timestamp
+        filename = f"{active_class}_{int(time.time() * 1000)}.png"
+        filepath = os.path.join(save_folder, filename)
+
+        cv2.imwrite(filepath, crop_32x32)
+        print(f"[{active_class.upper()}] Saved -> {filepath}")
+
+    # Press 'n' to cycle through classes
+    elif key == ord('n'):
+        current_class_idx = (current_class_idx + 1) % len(CLASSES)
+        print(f"\nSwitched active class to: [{CLASSES[current_class_idx].upper()}]")
+
+    # Press 'q' to quit
+    elif key == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

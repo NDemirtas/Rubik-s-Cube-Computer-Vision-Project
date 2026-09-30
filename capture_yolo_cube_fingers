@@ -1,0 +1,125 @@
+import cv2
+import os
+import time
+import glob
+from ultralytics import YOLO
+
+# 1. Path to your downloaded Roboflow dataset folder
+# Change this string if your dataset folder name is slightly different
+DATASET_DIR = "Rubik-s-Cube-Detection-1"
+
+TRAIN_IMG_DIR = os.path.join(DATASET_DIR, "train", "images")
+TRAIN_LBL_DIR = os.path.join(DATASET_DIR, "train", "labels")
+
+os.makedirs(TRAIN_IMG_DIR, exist_ok=True)
+os.makedirs(TRAIN_LBL_DIR, exist_ok=True)
+
+# 2. Find and load your latest best weights for auto-labeling
+weights_search = glob.glob("runs/detect/*/weights/best.pt")
+if weights_search:
+    MODEL_PATH = sorted(weights_search)[-1]  # Selects latest training run
+    print(f"Loading model weights from: {MODEL_PATH}")
+else:
+    print("Warning: Could not find custom weights, defaulting to baseline 'yolov8n.pt'")
+    MODEL_PATH = "yolov8n.pt"
+
+model = YOLO(MODEL_PATH)
+
+# Check existing files so we don't overwrite previous runs
+existing_files = glob.glob(os.path.join(TRAIN_IMG_DIR, "hand_frame_*.jpg"))
+start_index = len(existing_files)
+
+# Configuration
+TOTAL_PHOTOS_TO_CAPTURE = 150
+COUNTDOWN_SECONDS = 2.0
+CAPTURE_INTERVAL = 0.15  # Takes a photo every 150ms (~10-12 seconds of rotation)
+
+cap = cv2.VideoCapture(0)  # Change to 1 if using an external/secondary camera
+
+state = "IDLE"  # Modes: "IDLE", "COUNTDOWN", "RECORDING"
+countdown_start = 0
+last_capture_time = 0
+captured_count = 0
+
+print("\n--- INSTRUCTIONS ---")
+print("1. Press SPACE to trigger the 2-second countdown.")
+print("2. Put BOTH hands on the cube and rotate it slowly in front of the lens.")
+print(f"3. The camera will automatically burst-capture {TOTAL_PHOTOS_TO_CAPTURE} photos.")
+print("4. Press 'q' to quit at any time.\n")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    display_frame = frame.copy()
+    current_time = time.time()
+
+    key = cv2.waitKey(1) & 0xFF
+
+    # --- IDLE STATE ---
+    if state == "IDLE":
+        cv2.putText(display_frame, "Press SPACE to start (2s delay)", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        if key == ord(' '):
+            state = "COUNTDOWN"
+            countdown_start = time.time()
+            captured_count = 0
+
+    # --- COUNTDOWN STATE ---
+    elif state == "COUNTDOWN":
+        elapsed = current_time - countdown_start
+        remaining = COUNTDOWN_SECONDS - elapsed
+
+        if remaining > 0:
+            cv2.putText(display_frame, f"GET BOTH HANDS READY: {remaining:.1f}s", (20, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 165, 255), 3)
+        else:
+            state = "RECORDING"
+            last_capture_time = current_time
+
+    # --- RECORDING STATE ---
+    elif state == "RECORDING":
+        cv2.putText(display_frame, f"RECORDING! Rotate cube: {captured_count}/{TOTAL_PHOTOS_TO_CAPTURE}", (20, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
+
+        # Capture a photo every CAPTURE_INTERVAL seconds
+        if current_time - last_capture_time >= CAPTURE_INTERVAL and captured_count < TOTAL_PHOTOS_TO_CAPTURE:
+            file_idx = start_index + captured_count
+            img_name = f"hand_frame_{file_idx}.jpg"
+            lbl_name = f"hand_frame_{file_idx}.txt"
+
+            img_path = os.path.join(TRAIN_IMG_DIR, img_name)
+            lbl_path = os.path.join(TRAIN_LBL_DIR, lbl_name)
+
+            # Save current frame image
+            cv2.imwrite(img_path, frame)
+
+            # Auto-label using lower confidence threshold to catch hand-held cubes
+            results = model.predict(frame, conf=0.25, verbose=False)[0]
+
+            # Write standard normalized YOLO bounding box annotations
+            with open(lbl_path, "w") as f:
+                for box in results.boxes:
+                    cls = int(box.cls[0])
+                    xywhn = box.xywhn[0].tolist()  # [x_center, y_center, width, height] normalized
+                    f.write(f"{cls} {xywhn[0]:.6f} {xywhn[1]:.6f} {xywhn[2]:.6f} {xywhn[3]:.6f}\n")
+
+            captured_count += 1
+            last_capture_time = current_time
+
+        # Done with sequence
+        if captured_count >= TOTAL_PHOTOS_TO_CAPTURE:
+            print(f"\nSUCCESS! Added {TOTAL_PHOTOS_TO_CAPTURE} annotated images directly to {TRAIN_IMG_DIR}")
+            state = "IDLE"
+            start_index += TOTAL_PHOTOS_TO_CAPTURE
+
+    if key == ord('q'):
+        break
+
+    cv2.imshow("Hand-Held Rubik's Cube Dataset Collector", display_frame)
+
+cap.release()
+cv2.destroyAllWindows()

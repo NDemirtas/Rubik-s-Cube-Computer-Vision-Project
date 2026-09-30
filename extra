@@ -1,0 +1,8 @@
+from roboflow import Roboflow
+
+rf = Roboflow(api_key="7EdWUUZ4KVSWAQSdLDzn")
+project = rf.workspace("raghav-bharathi-vywgh").project("rubik-s-cube-ivvrq")
+version = project.version(3)
+
+# Download directly formatted for YOLOv8 Segmentation
+dataset = version.download("yolov8")

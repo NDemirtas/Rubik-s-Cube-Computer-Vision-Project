@@ -1,0 +1,24 @@
+import os
+import glob
+from ultralytics import YOLO
+
+# 1. Find your latest fine-tuned weights
+weights_search = glob.glob("runs/detect/*/weights/best.pt")
+latest_weights = sorted(weights_search)[-1]
+print(f"Loading weights from: {latest_weights}")
+
+model = YOLO(latest_weights)
+
+# 2. Path to your custom photos
+custom_images_pattern = "Rubik-s-Cube-Detection-1/train/images/hand_frame_*.jpg"
+
+# 3. Run predictions and save annotated images
+results = model.predict(
+    source=custom_images_pattern,
+    save=True,                 # Draws bounding boxes and labels on images
+    conf=0.25,                 # Minimum confidence score to display
+    name="custom_hand_inspection", # Saves output in runs/detect/custom_hand_inspection/
+    exist_ok=True
+)
+
+print("\nFinished! Check the folder: runs/detect/custom_hand_inspection/")

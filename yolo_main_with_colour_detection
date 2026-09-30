@@ -1,0 +1,162 @@
+import cv2
+import glob
+import numpy as np
+from ultralytics import YOLO
+from skimage.segmentation import slic
+from skimage.measure import regionprops
+
+# --- 1. CONFIGURATION & COLOR CALIBRATION ---
+# Reference colors in OpenCV LAB format: L [0..255], A [0..255], B [0..255]
+# Adjust these values based on your room lighting setup.
+COLOR_REFERENCES = {
+    'White':  np.array([240, 128, 128]),
+    'Yellow': np.array([210, 110, 180]),
+    'Red':    np.array([120, 180, 150]),
+    'Orange': np.array([150, 170, 170]),
+    'Blue':   np.array([100, 150, 70]),
+    'Green':  np.array([130, 80,  150])
+}
+
+# Standard BGR color representation for drawing on screen
+DRAW_COLORS = {
+    'White':  (255, 255, 255),
+    'Yellow': (0, 255, 255),
+    'Red':    (0, 0, 255),
+    'Orange': (0, 165, 255),
+    'Blue':   (255, 0, 0),
+    'Green':  (0, 255, 0),
+    'Unknown':(128, 128, 128)
+}
+
+def classify_lab_color(mean_lab):
+    """Finds the closest reference color using Euclidean distance in LAB space."""
+    best_color = 'Unknown'
+    min_dist = float('inf')
+    
+    for name, ref_lab in COLOR_REFERENCES.items():
+        dist = np.linalg.norm(mean_lab - ref_lab)
+        if dist < min_dist:
+            min_dist = dist
+            best_color = name
+            
+    return best_color
+
+
+# --- 2. MODEL INITIALIZATION ---
+weights_search = glob.glob("runs/detect/*/weights/best.pt")
+if weights_search:
+    MODEL_PATH = sorted(weights_search)[-1]
+    print(f"Loading model weights from: {MODEL_PATH}")
+else:
+    print("Warning: Could not find custom weights, defaulting to baseline 'yolov8n.pt'")
+    MODEL_PATH = "yolov8n.pt"
+
+model = YOLO(MODEL_PATH)
+cap = cv2.VideoCapture(1)
+
+print("Starting Rubik's Cube Detector + SLIC Color Reconstruction. Press 'q' to quit.")
+
+
+# --- 3. MAIN VIDEO LOOP ---
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+
+    # Run inference (Apple Silicon GPU via device="mps")
+    results = model(frame, device="mps", conf=0.4, verbose=False)
+    annotated_frame = results[0].plot()
+
+    # Process bounding boxes
+    for box in results[0].boxes:
+        # Extract crop bounds
+        x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+        
+        # Ensure bounding box is within frame boundaries
+        h_frame, w_frame, _ = frame.shape
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w_frame, x2), min(h_frame, y2)
+
+        crop = frame[y1:y2, x1:x2]
+        crop_h, crop_w, _ = crop.shape
+
+        # Ignore tiny crops
+        if crop_h < 50 or crop_w < 50:
+            continue
+
+        # Convert crop to LAB color space for SLIC & distance metrics
+        crop_lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+
+        # 1. Run SLIC (n_segments=16 gives room for 9 facelets + finger/border clutter)
+        segments = slic(crop, n_segments=16, compactness=10, sigma=1)
+
+        # 2. Extract superpixel candidates
+        facelet_candidates = []
+        for prop in regionprops(segments):
+            # Skip superpixels taking up less than 1.5% of crop area (likely edge noise)
+            if prop.area < (crop_h * crop_w * 0.015):
+                continue
+
+            cy, cx = prop.centroid
+            mask = (segments == prop.label)
+            mean_lab = cv2.mean(crop_lab, mask=mask.astype(np.uint8))[:3]
+
+            facelet_candidates.append({
+                'centroid': (cx, cy),
+                'color_lab': np.array(mean_lab),
+                'label': prop.label
+            })
+
+        # 3. Filter down to 9 facelets closest to the center of the crop
+        if len(facelet_candidates) >= 9:
+            center_x, center_y = crop_w / 2, crop_h / 2
+            facelet_candidates.sort(
+                key=lambda c: ((c['centroid'][0] - center_x)**2 + (c['centroid'][1] - center_y)**2)
+            )
+            selected_9 = facelet_candidates[:9]
+
+            # 4. Sort spatial centroids into a 3x3 grid
+            selected_9.sort(key=lambda c: c['centroid'][1])  # Sort by Y (top to bottom)
+
+            row_top = sorted(selected_9[0:3], key=lambda c: c['centroid'][0])  # Sort by X
+            row_mid = sorted(selected_9[3:6], key=lambda c: c['centroid'][0])
+            row_bot = sorted(selected_9[6:9], key=lambda c: c['centroid'][0])
+
+            grid_3x3 = [row_top, row_mid, row_bot]
+
+            # 5. Draw detected grid & colors onto the live feed
+            for row_idx, row in enumerate(grid_3x3):
+                for col_idx, item in enumerate(row):
+                    cx, cy = item['centroid']
+                    color_name = classify_lab_color(item['color_lab'])
+
+                    # Convert crop coordinates back to main frame coordinates
+                    frame_x = int(x1 + cx)
+                    frame_y = int(y1 + cy)
+
+                    draw_bgr = DRAW_COLORS.get(color_name, (128, 128, 128))
+
+                    # Draw color dot on the centroid
+                    cv2.circle(annotated_frame, (frame_x, frame_y), 6, draw_bgr, -1)
+                    cv2.circle(annotated_frame, (frame_x, frame_y), 7, (0, 0, 0), 1)
+
+                    # Optional: Print position index (row, col) next to dot
+                    cv2.putText(
+                        annotated_frame,
+                        f"{color_name[0]}", 
+                        (frame_x + 8, frame_y + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4,
+                        (255, 255, 255),
+                        1
+                    )
+
+    cv2.imshow("Custom YOLO Rubik's Cube Detector", annotated_frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

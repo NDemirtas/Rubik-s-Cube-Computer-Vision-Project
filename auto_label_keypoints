@@ -1,0 +1,108 @@
+import cv2
+import os
+import time
+import numpy as np
+
+# --- 1. SETUP DIRECTORIES ---
+TRAIN_IMG_DIR = "dataset/images/train"
+TRAIN_LBL_DIR = "dataset/labels/train"
+VAL_IMG_DIR = "dataset/images/val"
+VAL_LBL_DIR = "dataset/labels/val"
+
+for path in [TRAIN_IMG_DIR, TRAIN_LBL_DIR, VAL_IMG_DIR, VAL_LBL_DIR]:
+    os.makedirs(path, exist_ok=True)
+
+cap = cv2.VideoCapture(1)
+
+saved_count = 0
+last_save_time = 0
+
+print("\n--- MANUAL POSE DATASET GENERATOR ---")
+print("1. Align the front face of your Rubik's Cube inside the GREEN target box.")
+print("2. Press SPACEBAR to capture a frame (rotate/move the cube to get varied angles).")
+print("3. Press 'q' to stop.\n")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    h_frame, w_frame, _ = frame.shape
+    annotated = frame.copy()
+
+    # Define a 280x280 pixel bounding box in the center of the feed
+    box_size = 280
+    cx_frame, cy_frame = w_frame // 2, h_frame // 2
+
+    x1 = cx_frame - (box_size // 2)
+    y1 = cy_frame - (box_size // 2)
+    x2 = cx_frame + (box_size // 2)
+    y2 = cy_frame + (box_size // 2)
+
+    # Define 4 corner keypoints [Top-Left, Top-Right, Bottom-Right, Bottom-Left]
+    corners_global = np.array([
+        [x1, y1],
+        [x2, y1],
+        [x2, y2],
+        [x1, y2]
+    ])
+
+    # Draw visual target box
+    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    for idx, pt in enumerate(corners_global):
+        cv2.circle(annotated, tuple(pt), 6, (0, 0, 255), -1)
+
+    # Display HUD
+    cv2.putText(annotated, f"SAMPLES SAVED: {saved_count}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    cv2.putText(annotated, "Fit cube inside box and press SPACEBAR", (20, h_frame - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+    # Capture Key Inputs
+    key = cv2.waitKey(1) & 0xFF
+    current_time = time.time()
+
+    if (key == 32) and (current_time - last_save_time > 0.2):  # Spacebar keypress
+        # 1. Determine train vs val split (20% validation)
+        is_val = (saved_count % 5 == 0)
+        img_dir = VAL_IMG_DIR if is_val else TRAIN_IMG_DIR
+        lbl_dir = VAL_LBL_DIR if is_val else TRAIN_LBL_DIR
+
+        timestamp = int(time.time() * 1000)
+        filename = f"cube_pose_{timestamp}"
+
+        # 2. Save raw frame (un-annotated)
+        cv2.imwrite(os.path.join(img_dir, f"{filename}.jpg"), frame)
+
+        # 3. Calculate normalized YOLO values (0.0 to 1.0 scale)
+        box_x_c = ((x1 + x2) / 2.0) / w_frame
+        box_y_c = ((y1 + y2) / 2.0) / h_frame
+        box_w = (x2 - x1) / w_frame
+        box_h = (y2 - y1) / h_frame
+
+        # Format: <class-id> <x_center> <y_center> <width> <height> <px1> <py1> <v1> ...
+        label_parts = [f"0 {box_x_c:.6f} {box_y_c:.6f} {box_w:.6f} {box_h:.6f}"]
+        
+        for (kx, ky) in corners_global:
+            norm_kx = kx / w_frame
+            norm_ky = ky / h_frame
+            label_parts.append(f"{norm_kx:.6f} {norm_ky:.6f} 2")
+
+        label_str = " ".join(label_parts) + "\n"
+
+        with open(os.path.join(lbl_dir, f"{filename}.txt"), "w") as f:
+            f.write(label_str)
+
+        saved_count += 1
+        last_save_time = current_time
+
+    cv2.imshow("Manual YOLOv8-Pose Data Generator", annotated)
+
+    if key == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+
+print(f"\nDataset generation complete! Total samples: {saved_count}")

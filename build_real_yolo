@@ -1,0 +1,85 @@
+import os
+import cv2
+import numpy as np
+
+DATASET_DIR = "real_yolo_dataset"
+
+for split in ["train", "val"]:
+    os.makedirs(f"{DATASET_DIR}/images/{split}", exist_ok=True)
+    os.makedirs(f"{DATASET_DIR}/labels/{split}", exist_ok=True)
+
+abs_path = os.path.abspath(DATASET_DIR)
+yaml_content = f"""path: {abs_path}
+train: images/train
+val: images/val
+
+names:
+  0: facelet
+"""
+
+with open(f"{DATASET_DIR}/data.yaml", "w") as f:
+    f.write(yaml_content)
+
+cap = cv2.VideoCapture(1)
+count = 0
+print("="*60)
+print("AUTO-ANNOTATING REAL FACELETS")
+print("Hold your Rubik's Cube in front of the camera!")
+print("Press SPACE to save a frame with detected stickers.")
+print("Press 'q' when you have ~30 frames.")
+print("="*60)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    display = frame.copy()
+    
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 3)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    img_h, img_w = frame.shape[:2]
+    annotations = []
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if 300 < area < 25000:
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect_ratio = float(w) / h
+            if 0.6 <= aspect_ratio <= 1.4:
+                # Convert bounding box to YOLO normalized format [x_center, y_center, w, h]
+                x_center = (x + w / 2.0) / img_w
+                y_center = (y + h / 2.0) / img_h
+                norm_w = w / img_w
+                norm_h = h / img_h
+                
+                annotations.append(f"0 {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f}")
+                cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+    cv2.putText(display, f"Frames Captured: {count} | Detected Stickers: {len(annotations)}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.imshow("Auto-Annotator (Press SPACE to Save)", display)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == 32 and len(annotations) > 0:  # SPACE bar
+        split = "train" if count % 5 != 0 else "val"
+        
+        img_path = f"{DATASET_DIR}/images/{split}/frame_{count}.jpg"
+        lbl_path = f"{DATASET_DIR}/labels/{split}/frame_{count}.txt"
+
+        cv2.imwrite(img_path, frame)
+        with open(lbl_path, "w") as f:
+            f.write("\n".join(annotations))
+
+        count += 1
+        print(f"[{split.upper()}] Saved frame {count} with {len(annotations)} facelets annotated!")
+    elif key == ord('q') or count >= 30:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+print(f"\nDone! Dataset generated at: {DATASET_DIR}")

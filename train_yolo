@@ -1,0 +1,23 @@
+import os
+import glob
+from ultralytics import YOLO
+
+# 1. Clear dataset cache
+for c in glob.glob("Rubik-s-Cube-Detection-1/**/*.cache", recursive=True):
+    os.remove(c)
+
+# 2. Retrain on cleaned dataset
+model = YOLO("yolov8n.pt")
+data_yaml = os.path.abspath("Rubik-s-Cube-Detection-1/data.yaml")
+
+results = model.train(
+    data=data_yaml,
+    epochs=30,
+    imgsz=640,
+    batch=8,
+    device="mps",
+    name="rubiks_handheld_cleaned"
+)
+
+print("\nTraining Complete!")
+    print("Best weights saved at: runs/detect/rubiks_yolo_model/weights/best.pt")

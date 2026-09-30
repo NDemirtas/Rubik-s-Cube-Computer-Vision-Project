@@ -1,0 +1,94 @@
+import cv2
+import os
+import time
+
+# Create directories
+os.makedirs("dataset/images/train", exist_ok=True)
+os.makedirs("dataset/labels/train", exist_ok=True)
+
+cap = cv2.VideoCapture(0)
+count = 0
+
+print("\n--- 3D CUBE DATA COLLECTOR ---")
+print("1. Hold the Rubik's Cube at an angle inside the 3D Wireframe HUD.")
+print("2. Press SPACEBAR to capture an image + label pair.")
+print("3. Press 'q' when you have ~50-100 images.\n")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+    annotated = frame.copy()
+
+    # Define normalized 7 keypoints forming a 3D Isometric Cube Box
+    # Order: [0: Top, 1: Top-Left, 2: Top-Right, 3: Bottom-Left, 4: Center, 5: Bottom-Right, 6: Bottom-Center]
+    cx, cy = w // 2, h // 2
+    scale = 140
+
+    kpts = [
+        (cx, cy - int(scale * 1.1)),        # 0: Top
+        (cx - int(scale * 0.95), cy - int(scale * 0.55)), # 1: Top-Left
+        (cx + int(scale * 0.95), cy - int(scale * 0.55)), # 2: Top-Right
+        (cx - int(scale * 0.95), cy + int(scale * 0.55)), # 3: Bottom-Left
+        (cx, cy),                           # 4: Center
+        (cx + int(scale * 0.95), cy + int(scale * 0.55)), # 5: Bottom-Right
+        (cx, cy + int(scale * 1.1))         # 6: Bottom-Center
+    ]
+
+    # Draw Wireframe Overlay (Y-shape + outer border)
+    edges = [
+        (0,1), (0,2), (1,4), (2,4), # UP Face
+        (1,3), (3,6), (4,6),        # LEFT Face
+        (2,5), (5,6)                 # RIGHT Face
+    ]
+    for e1, e2 in edges:
+        cv2.line(annotated, kpts[e1], kpts[e2], (255, 105, 180), 2)
+
+    for i, pt in enumerate(kpts):
+        cv2.circle(annotated, pt, 5, (0, 255, 0), -1)
+
+    cv2.putText(annotated, f"Saved: {count} images", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    cv2.imshow("7-Point Cube Dataset Capture", annotated)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord(' '):  # SPACEBAR to capture
+        timestamp = int(time.time() * 1000)
+        img_name = f"cube_7kpt_{timestamp}.jpg"
+        lbl_name = f"cube_7kpt_{timestamp}.txt"
+
+        # Save raw unannotated image
+        cv2.imwrite(f"dataset/images/train/{img_name}", frame)
+
+        # Calculate bounding box encompassing all 7 points
+        xs = [pt[0] for pt in kpts]
+        ys = [pt[1] for pt in kpts]
+        min_x, max_x = min(xs) - 10, max(xs) + 10
+        min_y, max_y = min(ys) - 10, max(ys) + 10
+
+        bx = ((min_x + max_x) / 2.0) / w
+        by = ((min_y + max_y) / 2.0) / h
+        bw = (max_x - min_x) / w
+        bh = (max_y - min_y) / h
+
+        # Build YOLO Pose Label String: class bx by bw bh x1 y1 v1 ... x7 y7 v7
+        label_str = f"0 {bx:.6f} {by:.6f} {bw:.6f} {bh:.6f}"
+        for pt in kpts:
+            nx = pt[0] / w
+            ny = pt[1] / h
+            label_str += f" {nx:.6f} {ny:.6f} 2"
+
+        with open(f"dataset/labels/train/{lbl_name}", "w") as f:
+            f.write(label_str + "\n")
+
+        count += 1
+        print(f"Captured sample #{count}")
+
+    elif key == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

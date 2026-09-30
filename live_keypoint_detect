@@ -1,0 +1,170 @@
+import cv2
+import glob
+import numpy as np
+from ultralytics import YOLO
+
+# --- 1. HSV COLOR CALIBRATION ---
+COLOR_RANGES_HSV = {
+    'Red':    [((0, 120, 70), (10, 255, 255)), ((170, 120, 70), (180, 255, 255))],
+    'Orange': [((11, 120, 70), (25, 255, 255))],
+    'Yellow': [((26, 100, 100), (35, 255, 255))],
+    'Green':  [((36, 100, 80), (85, 255, 255))],
+    'Blue':   [((86, 100, 80), (125, 255, 255))],
+    'White':  [((0, 0, 160), (180, 50, 255))]
+}
+
+DRAW_COLORS = {
+    'White': (255, 255, 255), 'Yellow': (0, 255, 255), 'Red': (0, 0, 255),
+    'Orange': (0, 165, 255),  'Blue': (255, 0, 0),   'Green': (0, 255, 0),
+    'Unknown': (128, 128, 128)
+}
+
+# --- 2. 7-KEYPOINT FACE QUAD DEFINITIONS ---
+# Keypoint indices:
+# 0: Top, 1: Top-Left, 2: Top-Right, 3: Bottom-Left, 4: Center, 5: Bottom-Right, 6: Bottom-Center
+FACE_QUADS = {
+    'UP':    [0, 2, 4, 1],  # [Top, Top-Right, Center, Top-Left]
+    'LEFT':  [1, 4, 6, 3],  # [Top-Left, Center, Bottom-Center, Bottom-Left]
+    'RIGHT': [4, 2, 5, 6]   # [Center, Top-Right, Bottom-Right, Bottom-Center]
+}
+
+def identify_color(hsv_patch):
+    """Determines dominant HSV color in a patch."""
+    max_pixels = 0
+    best_color = 'Unknown'
+    for color_name, ranges in COLOR_RANGES_HSV.items():
+        total_mask = np.zeros(hsv_patch.shape[:2], dtype=np.uint8)
+        for (lower, upper) in ranges:
+            mask = cv2.inRange(hsv_patch, np.array(lower), np.array(upper))
+            total_mask = cv2.bitwise_or(total_mask, mask)
+            
+        count = cv2.countNonZero(total_mask)
+        if count > max_pixels:
+            max_pixels = count
+            best_color = color_name
+    return best_color
+
+
+def process_face_quad(frame, quad_pts, face_name, warp_size=240):
+    """Warps a 4-point perspective patch and extracts its 3x3 grid."""
+    dst_pts = np.float32([
+        [0, 0], [warp_size, 0], 
+        [warp_size, warp_size], [0, warp_size]
+    ])
+
+    M = cv2.getPerspectiveTransform(quad_pts, dst_pts)
+    flat_face = cv2.warpPerspective(frame, M, (warp_size, warp_size))
+    hsv_face = cv2.cvtColor(flat_face, cv2.COLOR_BGR2HSV)
+
+    cell_size = warp_size // 3
+    margin = int(cell_size * 0.35)  # Avoids black plastic borders
+    grid_3x3 = []
+
+    for r in range(3):
+        row_colors = []
+        for c in range(3):
+            x_start, y_start = c * cell_size, r * cell_size
+            patch = hsv_face[
+                y_start + margin : y_start + cell_size - margin,
+                x_start + margin : x_start + cell_size - margin
+            ]
+
+            color = identify_color(patch)
+            row_colors.append(color)
+
+            # Draw HUD overlay on warped face
+            draw_bgr = DRAW_COLORS.get(color, (128, 128, 128))
+            cv2.rectangle(flat_face, (x_start, y_start), 
+                          (x_start + cell_size, y_start + cell_size), (0, 255, 0), 1)
+            cv2.putText(flat_face, color[0], (x_start + (cell_size//2) - 10, y_start + (cell_size//2) + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, draw_bgr, 2)
+
+        grid_3x3.append(row_colors)
+
+    # Header label for the warped window
+    cv2.putText(flat_face, face_name, (10, 25), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    return flat_face, grid_3x3
+
+
+# --- 3. MODEL & CAMERA INITIALIZATION ---
+weights_search = glob.glob("runs/pose/*/weights/best.pt")
+if weights_search:
+    MODEL_PATH = sorted(weights_search)[-1]
+    print(f"Loading custom YOLOv8-Pose weights from: {MODEL_PATH}")
+else:
+    print("Warning: Custom pose weights not found. Defaulting to 'yolov8n-pose.pt'")
+    MODEL_PATH = "yolov8n-pose.pt"
+
+model = YOLO(MODEL_PATH)
+
+# Try camera index 1 first, fall back to 0 if unavailable
+cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
+
+print("Starting Multi-Face Rubik's Cube Detector. Press 'q' to quit.")
+
+
+# --- 4. MAIN INFERENCE LOOP ---
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: Could not read frame from camera. Check VideoCapture index.")
+        break
+
+    frame = cv2.flip(frame, 1)
+    annotated_frame = frame.copy()
+
+    # Run pose inference (conf threshold set to 0.35 to catch angled keypoints)
+    results = model(frame, device="mps", conf=0.35, verbose=False)
+
+    if results[0].keypoints is not None and len(results[0].keypoints) > 0:
+        kpts_data = results[0].keypoints.xy.cpu().numpy()
+
+        for obj_kpts in kpts_data:
+            num_kpts = len(obj_kpts)
+            if num_kpts < 4:
+                continue
+
+            # Draw keypoint dots on camera feed
+            for idx, pt in enumerate(obj_kpts):
+                if pt[0] > 0 and pt[1] > 0:
+                    cv2.circle(annotated_frame, (int(pt[0]), int(pt[1])), 5, (0, 255, 0), -1)
+
+            warped_faces = []
+
+            # --- CASE A: 7 KEYPOINTS DETECTED (Isometric View: Up to 3 Faces) ---
+            if num_kpts >= 7:
+                for face_name, indices in FACE_QUADS.items():
+                    quad_pts = np.float32([obj_kpts[i] for i in indices])
+                    
+                    # Check that all 4 points in this face polygon are non-zero/valid
+                    if np.all(quad_pts > 0):
+                        # Calculate polygon area to verify face is visible
+                        area = cv2.contourArea(quad_pts.astype(np.int32))
+                        if area > 1000:  # Valid visible face
+                            cv2.polylines(annotated_frame, [quad_pts.astype(np.int32)], True, (255, 0, 0), 2)
+                            flat_img, _ = process_face_quad(frame, quad_pts, face_name)
+                            warped_faces.append(flat_img)
+
+            # --- CASE B: 4 KEYPOINTS DETECTED (Head-on View: 1 Face Fallback) ---
+            elif num_kpts >= 4:
+                quad_pts = np.float32(obj_kpts[:4])
+                if np.all(quad_pts > 0):
+                    cv2.polylines(annotated_frame, [quad_pts.astype(np.int32)], True, (0, 255, 0), 2)
+                    flat_img, _ = process_face_quad(frame, quad_pts, "FRONT")
+                    warped_faces.append(flat_img)
+
+            # Render active warped views side-by-side
+            if len(warped_faces) > 0:
+                combined_views = np.hstack(warped_faces)
+                cv2.imshow("Detected Face Grid Views (1-3)", combined_views)
+
+    cv2.imshow("Custom YOLOv8-Pose Live Feed", annotated_frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
