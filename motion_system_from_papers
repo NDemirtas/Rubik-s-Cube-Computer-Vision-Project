@@ -1,0 +1,342 @@
+import cv2
+import numpy as np
+import time
+import glob
+from collections import deque, Counter
+from ultralytics import YOLO
+
+class PureGeometryCubeTracker:
+    def __init__(self, target_class_id=0, filter_window_size=5):
+        self.target_class_id = target_class_id
+        self.prev_gray = None
+        
+        # --- MODEL LOADING ---
+        weights_list = glob.glob("runs/segment/rubiks_seg_model/weights/best.pt")
+        if weights_list:
+            self.model_path = weights_list[0]
+            print(f"[INFO] Loaded custom YOLO model: {self.model_path}")
+        else:
+            self.model_path = "yolov8n-seg.pt"
+            print(f"[WARNING] Custom model not found, falling back to: {self.model_path}")
+        
+        self.model = YOLO(self.model_path)
+        
+        # --- TRACKING PARAMETERS ---
+        self.buffer_size = 1                  # Frame-by-frame evaluation
+        self.vec_buffer = deque(maxlen=self.buffer_size)
+        
+        # Geometry / Flow Thresholds
+        self.vector_deadzone = 0.2
+        self.min_total_energy = 2.0
+        self.min_slice_displacement = 1.0     # Low floor to capture fast sub-pixel movements
+        self.isolation_ratio = 1.2
+        self.purity_ratio = 1.2
+        
+        self.cooldown_frames = 1
+        self.cooldown_counter = 0
+        
+        # --- FILTERING & LOGGING ---
+        self.filter_window_size = filter_window_size
+        self.raw_move_window = []             # Collects raw detections up to window size
+        self.move_history = []
+        self.last_filtered_move = None
+        self.debug_energy = 0.0
+
+        # DIS Optical Flow Engine (Used purely for geometric direction vectors)
+        self.dis_flow = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
+
+    def _extract_cube_quad(self, results, w, h):
+        if results.boxes is None or len(results.boxes) == 0:
+            return None
+
+        if results.masks is not None and len(results.masks) > 0:
+            classes = results.boxes.cls.cpu().numpy()
+            target_indices = np.where(classes == self.target_class_id)[0]
+            if len(target_indices) == 0:
+                target_indices = np.array([0])
+
+            masks = [results.masks.xy[i] for i in target_indices if len(results.masks.xy[i]) > 0]
+            if not masks:
+                return None
+
+            best_poly = max(masks, key=lambda x: cv2.contourArea(x.astype(np.int32)))
+            rect = cv2.minAreaRect(best_poly.astype(np.int32))
+            box = cv2.boxPoints(rect)
+            return self._order_points(np.int32(box))
+        else:
+            classes = results.boxes.cls.cpu().numpy()
+            boxes = results.boxes.xyxy.cpu().numpy()
+            
+            target_indices = np.where(classes == self.target_class_id)[0]
+            if len(target_indices) == 0:
+                target_indices = np.array([0])
+
+            confidences = results.boxes.conf.cpu().numpy()[target_indices]
+            best_box_idx = target_indices[np.argmax(confidences)]
+            x1, y1, x2, y2 = boxes[best_box_idx].astype(np.int32)
+
+            pts = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.int32)
+            return self._order_points(pts)
+
+    def _order_points(self, pts):
+        rect = np.zeros((4, 2), dtype=np.int32)
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        return rect
+
+    def _subdivide_3x3(self, quad_pts):
+        tl, tr, br, bl = quad_pts.astype(np.float32)
+
+        src = np.array([[0, 0], [3, 0], [3, 3], [0, 3]], dtype=np.float32)
+        dst = np.array([tl, tr, br, bl], dtype=np.float32)
+
+        H, _ = cv2.findHomography(src, dst)
+        cell_polys = [[None for _ in range(3)] for _ in range(3)]
+
+        for r in range(3):
+            for c in range(3):
+                unit_cell = np.array([
+                    [c, r], [c + 1, r], 
+                    [c + 1, r + 1], [c, r + 1]
+                ], dtype=np.float32).reshape(-1, 1, 2)
+
+                projected = cv2.perspectiveTransform(unit_cell, H)
+                cell_polys[r][c] = projected.reshape(4, 2).astype(np.int32)
+
+        return cell_polys
+
+    def process_frame(self, frame):
+        h, w, _ = frame.shape
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if self.prev_gray is None:
+            self.prev_gray = gray
+            return frame
+
+        if self.cooldown_counter > 0:
+            self.cooldown_counter -= 1
+
+        # 1. Compute Optical Flow
+        flow = self.dis_flow.calc(self.prev_gray, gray, None)
+        self.prev_gray = gray
+
+        # 2. YOLO Quad Extraction
+        results = self.model(frame, verbose=False, conf=0.35)[0]
+        quad_pts = self._extract_cube_quad(results, w, h)
+
+        raw_vecs = np.zeros((3, 3, 2), dtype=np.float32)
+        cell_polys = [[None for _ in range(3)] for _ in range(3)]
+
+        if quad_pts is not None:
+            cell_polys = self._subdivide_3x3(quad_pts)
+
+            for r in range(3):
+                for c in range(3):
+                    poly = cell_polys[r][c]
+                    mask = np.zeros((h, w), dtype=np.uint8)
+                    cv2.fillPoly(mask, [poly], 255)
+
+                    c_flow = flow[mask == 255]
+                    if len(c_flow) > 0:
+                        u = np.mean(c_flow[:, 0])
+                        v = np.mean(c_flow[:, 1])
+                        mag = np.sqrt(u**2 + v**2)
+
+                        if mag >= self.vector_deadzone:
+                            raw_vecs[r, c] = [u, v]
+
+            self.vec_buffer.append(raw_vecs)
+        else:
+            self.vec_buffer.clear()
+
+        # 3. Evaluate Move
+        detected_move = None
+        if self.cooldown_counter == 0 and quad_pts is not None and len(self.vec_buffer) == self.buffer_size:
+            acc_vecs = np.sum(np.array(self.vec_buffer), axis=0)
+            detected_move = self._evaluate_move(acc_vecs)
+
+        if detected_move:
+            self.cooldown_counter = self.cooldown_frames
+            self.vec_buffer.clear()
+            self.raw_move_window.append(detected_move)
+
+            # Evaluate batch when window size reached
+            if len(self.raw_move_window) >= self.filter_window_size:
+                self._log_most_common_move()
+
+        # IDLE AUTO-FLUSH: If motion stopped after a 1-2 frame flick, flush buffer immediately
+        elif self.debug_energy < self.min_total_energy and len(self.raw_move_window) > 0:
+            self._log_most_common_move(flushed=True)
+
+        # 4. Rendering
+        display = frame.copy()
+        if quad_pts is not None:
+            cv2.polylines(display, [quad_pts], True, (0, 255, 255), 2)
+
+            for r in range(3):
+                for c in range(3):
+                    poly = cell_polys[r][c]
+                    if poly is not None:
+                        cv2.polylines(display, [poly], True, (80, 80, 80), 1)
+
+                        M = cv2.moments(poly)
+                        if M["m00"] != 0:
+                            cx = int(M["m10"] / M["m00"])
+                            cy = int(M["m01"] / M["m00"])
+                            u, v = raw_vecs[r, c]
+                            mag = np.sqrt(u**2 + v**2)
+
+                            if mag > 0.3:
+                                cv2.arrowedLine(display, (cx, cy), 
+                                                (int(cx + u * 2.0), int(cy + v * 2.0)), 
+                                                (0, 255, 0), 2, tipLength=0.3)
+
+        self._draw_hud(display, w, h)
+        return display
+
+    def _log_most_common_move(self, flushed=False):
+        counts = Counter(self.raw_move_window)
+        most_common_move, occurrences = counts.most_common(1)[0]
+        
+        timestamp = time.strftime("%H:%M:%S")
+        tag = " [FLUSHED]" if flushed else ""
+        log_str = f"[{timestamp}] MOVE: {most_common_move} ({occurrences}/{len(self.raw_move_window)}){tag}"
+        self.move_history.append(log_str)
+        self.last_filtered_move = most_common_move
+        
+        print(f"\033[92m{log_str}\033[0m")
+        self.raw_move_window.clear()
+
+    def _evaluate_move(self, vecs):
+        u_vals = vecs[:, :, 0]
+        v_vals = vecs[:, :, 1]
+        
+        cell_mags = np.sqrt(u_vals**2 + v_vals**2)
+        self.debug_energy = np.sum(cell_mags)
+
+        if self.debug_energy < self.min_total_energy:
+            return None
+
+        # =========================================================================
+        # 1. FRONT FACE ROTATION DETECTION (F / F') — VORTICITY / ROTATIONAL CIRCULATION
+        # =========================================================================
+        # Extract tangential velocities around the perimeter cells:
+        top_u = np.mean(u_vals[0, :])       # Top row horizontal flow
+        bottom_u = np.mean(u_vals[2, :])    # Bottom row horizontal flow
+        left_v = np.mean(v_vals[:, 0])      # Left col vertical flow
+        right_v = np.mean(v_vals[:, 2])     # Right col vertical flow
+
+        # Clockwise circulation index:
+        # F: Top moves right (+u), Right moves down (+v), Bottom moves left (-u), Left moves up (-v)
+        clockwise_score = (top_u - bottom_u) + (right_v - left_v)
+
+        # Threshold scaled for rotational sensitivity
+        curl_threshold = 2.5
+
+        # Check if the rotational score dominates all perimeter movement
+        if abs(clockwise_score) > curl_threshold:
+            # Purity check: ensure motion is spread across multiple outer cells, not just 1 slice
+            perimeter_activity = (np.abs(top_u) + np.abs(bottom_u) + 
+                                  np.abs(left_v) + np.abs(right_v))
+            
+            if perimeter_activity > 2.0:
+                if clockwise_score > 0:
+                    return "F  (Front Face CLOCKWISE)"
+                else:
+                    return "F' (Front Face COUNTER-CW)"
+
+        # =========================================================================
+        # 2. LINEAR SLICE TRANSLATIONS (R, L, U, D)
+        # =========================================================================
+        # Right Column (Col 2)
+        r_v = np.mean(v_vals[:, 2])
+        r_u = np.mean(abs(u_vals[:, 2]))
+        rest_v_right = np.mean(abs(v_vals[:, :2])) + 0.01
+
+        if (abs(r_v) > self.min_slice_displacement and 
+            abs(r_v) > (r_u * self.purity_ratio) and 
+            abs(r_v) > (rest_v_right * self.isolation_ratio)):
+            return "R' (Right Col DOWN)" if r_v > 0 else "R  (Right Col UP)"
+
+        # Left Column (Col 0)
+        l_v = np.mean(v_vals[:, 0])
+        l_u = np.mean(abs(u_vals[:, 0]))
+        rest_v_left = np.mean(abs(v_vals[:, 1:])) + 0.01
+
+        if (abs(l_v) > self.min_slice_displacement and 
+            abs(l_v) > (l_u * self.purity_ratio) and 
+            abs(l_v) > (rest_v_left * self.isolation_ratio)):
+            return "L  (Left Col DOWN)" if l_v > 0 else "L' (Left Col UP)"
+
+        # Top Row (Row 0)
+        u_u = np.mean(u_vals[0, :])
+        u_v = np.mean(abs(v_vals[0, :]))
+        rest_u_top = np.mean(abs(u_vals[1:, :])) + 0.01
+
+        if (abs(u_u) > self.min_slice_displacement and 
+            abs(u_u) > (u_v * self.purity_ratio) and 
+            abs(u_u) > (rest_u_top * self.isolation_ratio)):
+            return "U  (Top Row LEFT)" if u_u < 0 else "U' (Top Row RIGHT)"
+
+        # Bottom Row (Row 2)
+        d_u = np.mean(u_vals[2, :])
+        d_v = np.mean(abs(v_vals[2, :]))
+        rest_u_bot = np.mean(abs(u_vals[:2, :])) + 0.01
+
+        if (abs(d_u) > self.min_slice_displacement and 
+            abs(d_u) > (d_v * self.purity_ratio) and 
+            abs(d_u) > (rest_u_bot * self.isolation_ratio)):
+            return "D' (Bottom Row LEFT)" if d_u < 0 else "D  (Bottom Row RIGHT)"
+
+        return None
+
+    def _draw_hud(self, display, w, h):
+        cv2.rectangle(display, (0, 0), (w, 40), (20, 20, 20), -1)
+        buf_progress = f"{len(self.raw_move_window)}/{self.filter_window_size}"
+        status = f"SAMPLING: [{buf_progress}] | LAST: {self.last_filtered_move if self.last_filtered_move else 'WAITING'}"
+        cv2.putText(display, status, (20, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # Log Box
+        cv2.rectangle(display, (w - 280, h - 130), (w - 10, h - 10), (20, 20, 20), -1)
+        cv2.rectangle(display, (w - 280, h - 130), (w - 10, h - 10), (80, 80, 80), 1)
+        cv2.putText(display, "GEOMETRIC MOVES", (w - 265, h - 110), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+        for idx, entry in enumerate(self.move_history[-4:]):
+            cv2.putText(display, entry, (w - 270, h - 85 + (idx * 20)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+
+def main():
+    cap = cv2.VideoCapture(1)
+    cap.set(cv2.CAP_PROP_FPS, 60)
+    
+    # Clean geometry tracker with a window of 5 and auto-flush on idle
+    tracker = PureGeometryCubeTracker(target_class_id=0, filter_window_size=5)
+
+    if not cap.isOpened():
+        print("Error: Could not open camera.")
+        return
+
+    while True:
+        ret, frame = cap.read()
+        if not ret: 
+            break
+
+        frame = cv2.flip(frame, 1)
+        display_frame = tracker.process_frame(frame)
+
+        cv2.imshow("Pure Geometry Cube Tracker", display_frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord('q'), 27):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,641 @@
+import copy
+import glob
+import threading
+import time
+import cv2
+from flask import Flask, render_template_string
+from flask_socketio import SocketIO
+import numpy as np
+from ultralytics import YOLO
+
+# --- FLASK + SOCKET.IO SETUP ---
+app = Flask(__name__)
+app.config["SECRET_KEY"] = "rubiks_secret"
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+# --- CAMERA INITIALIZATION ---
+cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
+
+weights_list = glob.glob("runs/segment/rubiks_seg_model/weights/best.pt")
+MODEL_PATH = weights_list[0] if weights_list else "yolov8n-seg.pt"
+model = YOLO(MODEL_PATH)
+
+COLOR_RANGES_HSV = {
+    "Red": [
+        ((0, 150, 60), (6, 255, 255)),
+        ((168, 150, 60), (180, 255, 255)),
+    ],
+    "Orange": [((7, 140, 60), (22, 255, 255))],
+    "Yellow": [((23, 80, 100), (38, 255, 255))],
+    "Green": [((39, 80, 60), (85, 255, 255))],
+    "Blue": [((86, 80, 60), (125, 255, 255))],
+    "White": [((0, 0, 150), (180, 60, 255))],
+}
+
+
+class ConstrainedCubeTracker:
+
+    def __init__(self):
+        self.state = {}
+        self.active_camera_face = "Green"
+        self.last_move_detected = "None"
+        self.move_history = []
+        self.max_allowed_error = 2  # Max allowable sticker mismatches
+        self.last_grid = None
+        self.grid_stable_count = 0
+        self.reset_to_solved()
+
+    def reset_to_solved(self):
+        """Initializes the cube state to solved."""
+        self.state = {
+            "White": [["White"] * 3 for _ in range(3)],
+            "Yellow": [["Yellow"] * 3 for _ in range(3)],
+            "Green": [["Green"] * 3 for _ in range(3)],
+            "Blue": [["Blue"] * 3 for _ in range(3)],
+            "Orange": [["Orange"] * 3 for _ in range(3)],
+            "Red": [["Red"] * 3 for _ in range(3)],
+        }
+        self.active_camera_face = "Green"
+        self.last_move_detected = "None"
+        self.move_history = []
+        self.last_grid = None
+        self.grid_stable_count = 0
+        print("\n[CUBE STATE] Reset to SOLVED.\n")
+        self.broadcast_state()
+
+    def broadcast_state(self):
+        """Broadcasts current state via socketio if available."""
+        try:
+            socketio.emit(
+                "cube_update",
+                {
+                    "faces": self.state,
+                    "active_center": self.active_camera_face,
+                    "status": self.last_move_detected,
+                },
+            )
+        except NameError:
+            pass
+
+    @staticmethod
+    def rotate_matrix_cw(matrix):
+        return [list(row) for row in zip(*matrix[::-1])]
+
+    @staticmethod
+    def rotate_matrix_ccw(matrix):
+        return [list(row) for row in zip(*matrix)][::-1]
+
+    # --- STATE MUTATOR HELPERS ---
+    def _apply_u(self, s, is_prime=False):
+        orig_f, orig_r, orig_b, orig_l = (
+            list(s["Green"][0]),
+            list(s["Red"][0]),
+            list(s["Blue"][0]),
+            list(s["Orange"][0]),
+        )
+        if not is_prime:
+            s["Green"][0], s["Orange"][0], s["Blue"][0], s["Red"][0] = (
+                orig_r,
+                orig_f,
+                orig_l,
+                orig_b,
+            )
+            s["White"] = self.rotate_matrix_cw(s["White"])
+        else:
+            s["Green"][0], s["Red"][0], s["Blue"][0], s["Orange"][0] = (
+                orig_l,
+                orig_f,
+                orig_r,
+                orig_b,
+            )
+            s["White"] = self.rotate_matrix_ccw(s["White"])
+
+    def _apply_d(self, s, is_prime=False):
+        orig_f, orig_r, orig_b, orig_l = (
+            list(s["Green"][2]),
+            list(s["Red"][2]),
+            list(s["Blue"][2]),
+            list(s["Orange"][2]),
+        )
+        if not is_prime:
+            s["Green"][2], s["Red"][2], s["Blue"][2], s["Orange"][2] = (
+                orig_l,
+                orig_f,
+                orig_r,
+                orig_b,
+            )
+            s["Yellow"] = self.rotate_matrix_cw(s["Yellow"])
+        else:
+            s["Green"][2], s["Orange"][2], s["Blue"][2], s["Red"][2] = (
+                orig_r,
+                orig_f,
+                orig_l,
+                orig_b,
+            )
+            s["Yellow"] = self.rotate_matrix_ccw(s["Yellow"])
+
+    def _apply_l(self, s, is_prime=False):
+        u_col0 = [s["White"][r][0] for r in range(3)]
+        f_col0 = [s["Green"][r][0] for r in range(3)]
+        d_col0 = [s["Yellow"][r][0] for r in range(3)]
+        b_col2 = [s["Blue"][r][2] for r in range(3)]
+
+        if not is_prime:
+            for r in range(3):
+                s["Green"][r][0] = d_col0[r]
+                s["Yellow"][r][0] = b_col2[2 - r]
+                s["Blue"][r][2] = u_col0[2 - r]
+                s["White"][r][0] = f_col0[r]
+            s["Orange"] = self.rotate_matrix_cw(s["Orange"])
+        else:
+            for r in range(3):
+                s["Green"][r][0] = u_col0[r]
+                s["White"][r][0] = b_col2[2 - r]
+                s["Blue"][r][2] = d_col0[2 - r]
+                s["Yellow"][r][0] = f_col0[r]
+            s["Orange"] = self.rotate_matrix_ccw(s["Orange"])
+
+    def _apply_r(self, s, is_prime=False):
+        u_col2 = [s["White"][r][2] for r in range(3)]
+        f_col2 = [s["Green"][r][2] for r in range(3)]
+        d_col2 = [s["Yellow"][r][2] for r in range(3)]
+        b_col0 = [s["Blue"][r][0] for r in range(3)]
+
+        if not is_prime:
+            for r in range(3):
+                s["Green"][r][2] = u_col2[r]
+                s["White"][r][2] = b_col0[2 - r]
+                s["Blue"][r][0] = d_col2[2 - r]
+                s["Yellow"][r][2] = f_col2[r]
+            s["Red"] = self.rotate_matrix_cw(s["Red"])
+        else:
+            for r in range(3):
+                s["Green"][r][2] = d_col2[r]
+                s["Yellow"][r][2] = b_col0[2 - r]
+                s["Blue"][r][0] = u_col2[2 - r]
+                s["White"][r][2] = f_col2[r]
+            s["Red"] = self.rotate_matrix_ccw(s["Red"])
+
+    def _apply_e(self, s, is_prime=False):
+        f_r1, r_r1, b_r1, l_r1 = (
+            list(s["Green"][1]),
+            list(s["Red"][1]),
+            list(s["Blue"][1]),
+            list(s["Orange"][1]),
+        )
+        if not is_prime:
+            s["Green"][1], s["Red"][1], s["Blue"][1], s["Orange"][1] = (
+                l_r1,
+                f_r1,
+                r_r1,
+                b_r1,
+            )
+        else:
+            s["Green"][1], s["Orange"][1], s["Blue"][1], s["Red"][1] = (
+                r_r1,
+                f_r1,
+                l_r1,
+                b_r1,
+            )
+
+    def _apply_m(self, s, is_prime=False):
+        u_c1 = [s["White"][r][1] for r in range(3)]
+        f_c1 = [s["Green"][r][1] for r in range(3)]
+        d_c1 = [s["Yellow"][r][1] for r in range(3)]
+        b_c1 = [s["Blue"][r][1] for r in range(3)]
+
+        if not is_prime:
+            for r in range(3):
+                s["Green"][r][1] = u_c1[r]
+                s["Yellow"][r][1] = f_c1[r]
+                s["Blue"][r][1] = d_c1[2 - r]
+                s["White"][r][1] = b_c1[2 - r]
+        else:
+            for r in range(3):
+                s["Green"][r][1] = d_c1[r]
+                s["White"][r][1] = f_c1[r]
+                s["Blue"][r][1] = u_c1[2 - r]
+                s["Yellow"][r][1] = b_c1[2 - r]
+
+    def _apply_x(self, s, is_prime=False):
+        orig_f, orig_u, orig_b, orig_d = (
+            [r[:] for r in s["Green"]],
+            [r[:] for r in s["White"]],
+            [r[:] for r in s["Blue"]],
+            [r[:] for r in s["Yellow"]],
+        )
+        if not is_prime:
+            s["Green"], s["White"], s["Blue"], s["Yellow"] = (
+                orig_d,
+                orig_f,
+                [orig_u[2 - r][::-1] for r in range(3)],
+                [orig_b[2 - r][::-1] for r in range(3)],
+            )
+            s["Red"] = self.rotate_matrix_cw(s["Red"])
+            s["Orange"] = self.rotate_matrix_ccw(s["Orange"])
+        else:
+            s["Green"], s["Yellow"], s["Blue"], s["White"] = (
+                orig_u,
+                orig_f,
+                [orig_d[2 - r][::-1] for r in range(3)],
+                [orig_b[2 - r][::-1] for r in range(3)],
+            )
+            s["Red"] = self.rotate_matrix_ccw(s["Red"])
+            s["Orange"] = self.rotate_matrix_cw(s["Orange"])
+
+    def _apply_y(self, s, is_prime=False):
+        orig_f, orig_r, orig_b, orig_l = (
+            [r[:] for r in s["Green"]],
+            [r[:] for r in s["Red"]],
+            [r[:] for r in s["Blue"]],
+            [r[:] for r in s["Orange"]],
+        )
+        if not is_prime:
+            s["Green"], s["Red"], s["Blue"], s["Orange"] = (
+                orig_l,
+                orig_f,
+                orig_r,
+                orig_b,
+            )
+            s["White"] = self.rotate_matrix_ccw(s["White"])
+            s["Yellow"] = self.rotate_matrix_cw(s["Yellow"])
+        else:
+            s["Green"], s["Orange"], s["Blue"], s["Red"] = (
+                orig_r,
+                orig_f,
+                orig_l,
+                orig_b,
+            )
+            s["White"] = self.rotate_matrix_cw(s["White"])
+            s["Yellow"] = self.rotate_matrix_ccw(s["Yellow"])
+
+    # --- LEGAL GRAPH & MATCHING ENGINE ---
+    def get_all_legal_next_states(self):
+        moves = {
+            "U": lambda s: self._apply_u(s, False),
+            "U'": lambda s: self._apply_u(s, True),
+            "D": lambda s: self._apply_d(s, False),
+            "D'": lambda s: self._apply_d(s, True),
+            "L": lambda s: self._apply_l(s, False),
+            "L'": lambda s: self._apply_l(s, True),
+            "R": lambda s: self._apply_r(s, False),
+            "R'": lambda s: self._apply_r(s, True),
+            "E": lambda s: self._apply_e(s, False),
+            "E'": lambda s: self._apply_e(s, True),
+            "M": lambda s: self._apply_m(s, False),
+            "M'": lambda s: self._apply_m(s, True),
+            "x": lambda s: self._apply_x(s, False),
+            "x'": lambda s: self._apply_x(s, True),
+            "y": lambda s: self._apply_y(s, False),
+            "y'": lambda s: self._apply_y(s, True),
+        }
+        candidates = {}
+        for move_name, func in moves.items():
+            simulated_state = copy.deepcopy(self.state)
+            func(simulated_state)
+            candidates[move_name] = (simulated_state["Green"], simulated_state)
+        return candidates
+
+    def calculate_grid_distance(self, scanned_grid, candidate_grid):
+        mismatches = 0
+        for r in range(3):
+            for c in range(3):
+                if scanned_grid[r][c] == "Unknown":
+                    continue
+                if scanned_grid[r][c] != candidate_grid[r][c]:
+                    mismatches += 1
+        return mismatches
+
+    def process_frame_with_constraints(self, scanned_grid):
+        # 1. Debounce Grid: Make sure image is stationary (same grid for 2 frames)
+        if self.last_grid is not None and scanned_grid == self.last_grid:
+            self.grid_stable_count += 1
+        else:
+            self.grid_stable_count = 0
+            self.last_grid = scanned_grid
+            return None
+
+        if self.grid_stable_count < 2:
+            return None
+
+        # 2. Check if scanned frame matches CURRENT state (no turn occurred)
+        current_dist = self.calculate_grid_distance(
+            scanned_grid, self.state["Green"]
+        )
+        if current_dist <= self.max_allowed_error:
+            return None  # Cube hasn't moved
+
+        # 3. Search Candidate States for Valid Permutations
+        candidates = self.get_all_legal_next_states()
+        best_move = None
+        best_distance = 999
+        best_new_state = None
+
+        for move_name, (predicted_grid, state_after_move) in candidates.items():
+            dist = self.calculate_grid_distance(scanned_grid, predicted_grid)
+            if dist < best_distance:
+                best_distance = dist
+                best_move = move_name
+                best_new_state = state_after_move
+
+        # 4. Commit State Transition if within error threshold
+        if best_distance <= self.max_allowed_error and best_move is not None:
+            self.state = best_new_state
+            self.active_camera_face = self.state["Green"][1][1]
+            self.last_move_detected = f"Move Detected: {best_move}"
+            self.move_history.append(best_move)
+            print(
+                f"[VALIDATED MOVE] Executed {best_move} (Error: {best_distance})"
+            )
+            self.broadcast_state()
+            self.grid_stable_count = 0  # Reset debounce tracker
+            return best_move
+
+        return None
+
+
+def get_color_from_patch(hsv_patch):
+    total_pixels = hsv_patch.shape[0] * hsv_patch.shape[1]
+    if total_pixels == 0:
+        return "Unknown"
+
+    best_color = "Unknown"
+    max_match_pct = 0.0
+
+    for col_name, ranges in COLOR_RANGES_HSV.items():
+        mask = np.zeros(hsv_patch.shape[:2], dtype=np.uint8)
+        for lower, upper in ranges:
+            mask = cv2.bitwise_or(
+                mask, cv2.inRange(hsv_patch, np.array(lower), np.array(upper))
+            )
+
+        match_pct = cv2.countNonZero(mask) / total_pixels
+        if match_pct > max_match_pct and match_pct > 0.15:
+            max_match_pct = match_pct
+            best_color = col_name
+
+    return best_color
+
+
+def extract_facelet_grid(frame, quad_pts, warp_size=240):
+    dst_pts = np.float32(
+        [[0, 0], [warp_size, 0], [warp_size, warp_size], [0, warp_size]]
+    )
+    M = cv2.getPerspectiveTransform(quad_pts.astype(np.float32), dst_pts)
+    flat_face = cv2.warpPerspective(frame, M, (warp_size, warp_size))
+    hsv_face = cv2.cvtColor(flat_face, cv2.COLOR_BGR2HSV)
+
+    cell_size = warp_size // 3
+    margin = int(cell_size * 0.35)
+
+    grid = [["Unknown"] * 3 for _ in range(3)]
+
+    for r in range(3):
+        for c in range(3):
+            x_start, y_start = c * cell_size, r * cell_size
+            hsv_patch = hsv_face[
+                y_start + margin : y_start + cell_size - margin,
+                x_start + margin : x_start + cell_size - margin,
+            ]
+            grid[r][c] = get_color_from_patch(hsv_patch)
+
+    return grid
+
+
+# --- EMBEDDED WEB PAGE FOR 3D VISUALIZATION ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>3D Rubik's Cube Viewer</title>
+    <style>
+        body { margin: 0; background: #111; color: #fff; font-family: sans-serif; overflow: hidden; }
+        #hud { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.8); padding: 15px; border-radius: 8px; z-index: 10; }
+        #canvas { width: 100vw; height: 100vh; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+    <div id="hud">
+        <h2>Live 3D Cube State</h2>
+        <p>Active Face: <b id="active">-</b></p>
+        <p>Status: <span id="status">Connecting...</span></p>
+    </div>
+    <div id="canvas"></div>
+    <script>
+        const socket = io();
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x111111);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(5, 5, 7);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.getElementById('canvas').appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        const COLOR_MAP = {
+            'White': 0xffffff, 'Yellow': 0xffff00,
+            'Green': 0x00ff00, 'Blue': 0x0000ff,
+            'Orange': 0xffa500, 'Red': 0xff0000,
+            'Unknown': 0x222222
+        };
+
+        let cubies = [];
+
+        function createCube() {
+            const size = 0.95;
+            const geometry = new THREE.BoxGeometry(size, size, size);
+
+            for (let x = -1; x <= 1; x++) {
+                for (let y = -1; y <= 1; y++) {
+                    for (let z = -1; z <= 1; z++) {
+                        if (x === 0 && y === 0 && z === 0) continue;
+                        const materials = Array(6).fill().map(() => new THREE.MeshBasicMaterial({ color: 0x111111 }));
+                        const mesh = new THREE.Mesh(geometry, materials);
+                        mesh.position.set(x, y, z);
+                        scene.add(mesh);
+                        cubies.push({ mesh, x, y, z });
+                    }
+                }
+            }
+        }
+
+        function update3DCube(faces) {
+            cubies.forEach(cubie => {
+                const { mesh, x, y, z } = cubie;
+                const mats = mesh.material;
+                if (x === 1) mats[0].color.setHex(COLOR_MAP[faces.Red[1 - y][z + 1]] || 0x222222);
+                if (x === -1) mats[1].color.setHex(COLOR_MAP[faces.Orange[1 - y][1 - z]] || 0x222222);
+                if (y === 1) mats[2].color.setHex(COLOR_MAP[faces.White[1 - z][x + 1]] || 0x222222);
+                if (y === -1) mats[3].color.setHex(COLOR_MAP[faces.Yellow[z + 1][x + 1]] || 0x222222);
+                if (z === 1) mats[4].color.setHex(COLOR_MAP[faces.Green[1 - y][x + 1]] || 0x222222);
+                if (z === -1) mats[5].color.setHex(COLOR_MAP[faces.Blue[1 - y][2 - (x + 1)]] || 0x222222);
+            });
+        }
+
+        createCube();
+
+        socket.on('cube_update', (data) => {
+            document.getElementById('active').innerText = data.active_center || 'None';
+            document.getElementById('status').innerText = data.status || 'Active';
+            if (data.faces) update3DCube(data.faces);
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+
+@socketio.on("connect")
+def handle_connect():
+    cube_tracker.broadcast_state()
+
+
+def run_server():
+    socketio.run(
+        app, host="0.0.0.0", port=5001, debug=False, use_reloader=False
+    )
+
+
+# Global cube instance
+cube_tracker = ConstrainedCubeTracker()
+
+
+def main():
+    # Start web server in background thread
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+    print("\n[3D VIEWER READY] Open http://localhost:5001 in your browser.\n")
+
+    last_process_time = 0.0
+    process_interval = 0.15
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1)
+        h_frame, w_frame, _ = frame.shape
+        display_frame = frame.copy()
+
+        results = model(frame, conf=0.40, verbose=False)[0]
+        quad_corners = None
+
+        if results.masks is not None and len(results.masks) > 0:
+            masks = results.masks.data.cpu().numpy()
+            boxes = results.boxes.xyxy.cpu().numpy().astype(int)
+            best_idx = np.argmax([(b[2] - b[0]) * (b[3] - b[1]) for b in boxes])
+
+            mask_resized = cv2.resize(masks[best_idx], (w_frame, h_frame))
+            mask_binary = (mask_resized > 0.5).astype(np.uint8) * 255
+
+            contours, _ = cv2.findContours(
+                mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            if contours:
+                cnt = max(contours, key=cv2.contourArea)
+                peri = cv2.arcLength(cnt, True)
+                approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
+                pts = (
+                    approx.reshape(4, 2)
+                    if len(approx) == 4
+                    else cv2.boxPoints(cv2.minAreaRect(cnt))
+                )
+
+                s = pts.sum(axis=1)
+                diff = np.diff(pts, axis=1)
+                rect = np.zeros((4, 2), dtype="float32")
+                rect[0] = pts[np.argmin(s)]
+                rect[2] = pts[np.argmax(s)]
+                rect[1] = pts[np.argmin(diff)]
+                rect[3] = pts[np.argmax(diff)]
+                quad_corners = rect
+
+                cv2.polylines(
+                    display_frame,
+                    [quad_corners.astype(np.int32)],
+                    True,
+                    (0, 255, 0),
+                    2,
+                )
+
+        now = time.time()
+        if quad_corners is not None and (now - last_process_time) > process_interval:
+            last_process_time = now
+            current_grid = extract_facelet_grid(frame, quad_corners)
+            # Corrected method invocation with constraints
+            cube_tracker.process_frame_with_constraints(current_grid)
+
+        # On-Screen HUD Overlay
+        cv2.putText(
+            display_frame,
+            f"Focused Face: {cube_tracker.active_camera_face}",
+            (20, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
+        cv2.putText(
+            display_frame,
+            f"{cube_tracker.last_move_detected}",
+            (20, 70),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 0),
+            2,
+        )
+        cv2.putText(
+            display_frame,
+            f"History: {' '.join(cube_tracker.move_history[-10:])}",
+            (20, 105),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 0, 0),
+            1,
+        )
+        cv2.putText(
+            display_frame,
+            "Press 'r' to Reset | Press 'q' to Quit",
+            (20, h_frame - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 0),
+            1,
+        )
+
+        cv2.imshow("Rubik's Move Logger", display_frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        elif key == ord("r"):
+            cube_tracker.reset_to_solved()
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,28 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+# Load your custom model
+model = YOLO("runs/pose/rubiks_pose_model-3/weights/best.pt")
+
+cap = cv2.VideoCapture(1) # or test image path
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+
+    results = model(frame, conf=0.3, verbose=False)[0]
+
+    if results.keypoints is not None and len(results.keypoints) > 0:
+        kpts = results.keypoints.xy.cpu().numpy()[0]
+
+        # Draw only the index labels so you know which point is which
+        for idx, (x, y) in enumerate(kpts):
+            if x > 0 and y > 0:
+                cv2.circle(frame, (int(x), int(y)), 5, (0, 0, 255), -1)
+                cv2.putText(frame, f"K{idx}", (int(x) + 5, int(y) - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+    cv2.imshow("Identifying Keypoint Indices", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'): break
+cap.release(); cv2.destroyAllWindows()

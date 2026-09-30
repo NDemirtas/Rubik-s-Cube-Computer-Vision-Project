@@ -1,0 +1,41 @@
+import os
+import glob
+import cv2
+
+DATASET_DIR = "Rubik-s-Cube-Detection-1/train"
+IMG_DIR = os.path.join(DATASET_DIR, "images")
+LBL_DIR = os.path.join(DATASET_DIR, "labels")
+
+image_files = glob.glob(os.path.join(IMG_DIR, "hand_frame_*.jpg"))
+purged_count = 0
+
+for img_path in image_files:
+    base_name = os.path.basename(img_path).replace(".jpg", "")
+    lbl_path = os.path.join(LBL_DIR, base_name + ".txt")
+
+    should_delete = False
+
+    # Check 1: Missing label file or 0-byte label file (False Negative Frame)
+    if not os.path.exists(lbl_path) or os.path.getsize(lbl_path) == 0:
+        should_delete = True
+    else:
+        # Check 2: Parse box bounds to check for invalid aspect ratios or tiny boxes
+        with open(lbl_path, "r") as f:
+            lines = f.readlines()
+            if not lines:
+                should_delete = True
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) == 5:
+                    w, h = float(parts[3]), float(parts[4])
+                    # Purge extremely tiny false detections (< 5% of screen size)
+                    if w < 0.05 or h < 0.05:
+                        should_delete = True
+                        break
+
+    if should_delete:
+        if os.path.exists(img_path): os.remove(img_path)
+        if os.path.exists(lbl_path): os.remove(lbl_path)
+        purged_count += 1
+
+print(f"Purged {purged_count} empty/invalid auto-labeled frames.")

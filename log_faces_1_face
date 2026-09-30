@@ -1,0 +1,484 @@
+import cv2
+import glob
+import numpy as np
+from ultralytics import YOLO
+
+# --- CAMERA INITIALIZATION ---
+cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
+
+# --- LOAD YOLOV8 MODEL ---
+weights_search = glob.glob("runs/detect/*/weights/best.pt") + glob.glob("runs/pose/*/weights/best.pt")
+MODEL_PATH = sorted(weights_search)[-1] if weights_search else "yolov8n.pt"
+model = YOLO(MODEL_PATH)
+
+# --- REFINED HSV COLOR BOUNDS ---
+COLOR_RANGES_HSV = {
+    'Red':    [((0, 150, 60), (6, 255, 255)), ((168, 150, 60), (180, 255, 255))],
+    'Orange': [((7, 140, 60), (22, 255, 255))],
+    'Yellow': [((23, 80, 100), (38, 255, 255))],
+    'Green':  [((39, 80, 60), (85, 255, 255))],
+    'Blue':   [((86, 80, 60), (125, 255, 255))],
+    'White':  [((0, 0, 150), (180, 60, 255))]
+}
+
+DRAW_COLORS = {
+    'White': (255, 255, 255), 'Yellow': (0, 255, 255), 'Red': (0, 0, 255),
+    'Orange': (0, 165, 255),  'Blue': (255, 0, 0),   'Green': (0, 255, 0),
+    'Unknown': (128, 128, 128)
+}
+
+# --- GLOBAL STATE TRACKING ---
+CUBE_STATE = {
+    'White':  [['Unknown']*3 for _ in range(3)],
+    'Yellow': [['Unknown']*3 for _ in range(3)],
+    'Red':    [['Unknown']*3 for _ in range(3)],
+    'Orange': [['Unknown']*3 for _ in range(3)],
+    'Green':  [['Unknown']*3 for _ in range(3)],
+    'Blue':   [['Unknown']*3 for _ in range(3)]
+}
+
+CURRENT_CENTER = None
+
+# Pipeline State
+yolo_active = False
+latest_roi = None
+snapped_photo = None
+detected_quad_corners = None
+f_press_count = 0
+
+
+def find_all_stickers(roi, strictness_level=0):
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    block_size = max(5, 11 - (strictness_level * 2))
+    thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                   cv2.THRESH_BINARY_INV, block_size, 2)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    stickers = []
+    roi_area = roi.shape[0] * roi.shape[1]
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if (roi_area * 0.002) < area < (roi_area * 0.25):
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+
+            if 4 <= len(approx) <= 8:
+                rect = cv2.minAreaRect(cnt)
+                (cx, cy), (w, h), angle = rect
+                if w > 0 and h > 0:
+                    aspect_ratio = max(w, h) / min(w, h)
+                    if aspect_ratio < 1.6:
+                        stickers.append({
+                            'center': np.array([cx, cy], dtype=np.float32),
+                            'size': (w + h) / 2.0,
+                            'angle': angle
+                        })
+    return stickers
+
+
+def order_quad_points(pts):
+    pts = pts.reshape((4, 2))
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+def reconstruct_quad_from_facelet_vectors(cluster_stickers):
+    pts = np.array([s['center'] for s in cluster_stickers], dtype=np.float32)
+    sizes = [s['size'] for s in cluster_stickers]
+    single_s = np.median(sizes) if len(sizes) > 0 else 30.0
+
+    clean_angles = []
+    for s in cluster_stickers:
+        ang = s['angle']
+        if ang < -45: ang += 90
+        if abs(ang) < 15: ang = 0.0
+        clean_angles.append(ang)
+
+    median_angle_deg = np.median(clean_angles) if len(clean_angles) > 0 else 0.0
+    angle_rad = np.radians(median_angle_deg)
+
+    u_vec = np.array([np.cos(angle_rad), np.sin(angle_rad)], dtype=np.float32)
+    v_vec = np.array([-np.sin(angle_rad), np.cos(angle_rad)], dtype=np.float32)
+
+    proj_u = np.array([np.dot(p, u_vec) for p in pts])
+    proj_v = np.array([np.dot(p, v_vec) for p in pts])
+
+    pitch = single_s * 1.30
+
+    min_u, min_v = np.min(proj_u), np.min(proj_v)
+    u_indices = np.round((proj_u - min_u) / pitch).astype(int)
+    v_indices = np.round((proj_v - min_v) / pitch).astype(int)
+
+    u_cols, v_rows = set(u_indices), set(v_indices)
+
+    if 0 in u_cols and 1 in u_cols and 2 not in u_cols:
+        u_start = min_u - (single_s * 0.5)
+        u_end   = u_start + (3.0 * pitch)
+    else:
+        u_start = min_u - (single_s * 0.5)
+        u_end   = max(np.max(proj_u) + (single_s * 0.5), u_start + (3.0 * pitch))
+
+    if 0 in v_rows and 1 in v_rows and 2 in v_rows:
+        v_start = min_v - (single_s * 0.5)
+        v_end   = np.max(proj_v[v_indices == 2]) + (single_s * 0.5)
+    else:
+        v_start = min_v - (single_s * 0.5)
+        v_end   = v_start + (3.0 * pitch)
+
+    corner_tl = (u_start * u_vec) + (v_start * v_vec)
+    corner_tr = (u_end   * u_vec) + (v_start * v_vec)
+    corner_br = (u_end   * u_vec) + (v_end   * v_vec)
+    corner_bl = (u_start * u_vec) + (v_end   * v_vec)
+
+    return order_quad_points(np.array([corner_tl, corner_tr, corner_br, corner_bl], dtype=np.float32))
+
+
+def get_skin_mask(bgr_patch):
+    ycbcr = cv2.cvtColor(bgr_patch, cv2.COLOR_BGR2YCrCb)
+    lower_skin = np.array([0, 130, 75], dtype=np.uint8)
+    upper_skin = np.array([255, 175, 130], dtype=np.uint8)
+    return cv2.inRange(ycbcr, lower_skin, upper_skin)
+
+
+def check_patch_texture_and_variance(bgr_patch):
+    std_dev_bgr = np.std(bgr_patch, axis=(0, 1))
+    avg_std_dev = np.mean(std_dev_bgr)
+    
+    gray_patch = cv2.cvtColor(bgr_patch, cv2.COLOR_BGR2GRAY)
+    laplacian_var = cv2.Laplacian(gray_patch, cv2.CV_64F).var()
+    
+    return avg_std_dev, laplacian_var
+
+
+def rotate_matrix_90_cw(matrix):
+    return [list(row) for row in zip(*matrix[::-1])]
+
+
+def get_matrix_rotations(matrix):
+    r0 = matrix
+    r90 = rotate_matrix_90_cw(r0)
+    r180 = rotate_matrix_90_cw(r90)
+    r270 = rotate_matrix_90_cw(r180)
+    return [r0, r90, r180, r270]
+
+
+def auto_align_and_merge(scanned_grid):
+    global CUBE_STATE, CURRENT_CENTER
+    
+    center_color = scanned_grid[1][1]
+    if center_color not in CUBE_STATE or center_color in ['Unknown', 'Obstructed']:
+        return
+
+    CURRENT_CENTER = center_color
+    master_grid = CUBE_STATE[center_color]
+
+    known_master_facelets = sum(
+        1 for r in range(3) for c in range(3) 
+        if master_grid[r][c] not in ['Unknown', 'Obstructed'] and (r != 1 or c != 1)
+    )
+
+    best_scanned_rot = scanned_grid
+    
+    if known_master_facelets > 0:
+        rotations = get_matrix_rotations(scanned_grid)
+        best_score = -999
+        
+        for rot in rotations:
+            score = 0
+            for r in range(3):
+                for c in range(3):
+                    m_val = master_grid[r][c]
+                    s_val = rot[r][c]
+                    if m_val not in ['Unknown', 'Obstructed'] and s_val not in ['Unknown', 'Obstructed']:
+                        if m_val == s_val:
+                            score += 2
+                        else:
+                            score -= 3
+            
+            if score > best_score:
+                best_score = score
+                best_scanned_rot = rot
+
+    for r in range(3):
+        for c in range(3):
+            new_val = best_scanned_rot[r][c]
+            if new_val not in ['Obstructed', 'Unknown']:
+                master_grid[r][c] = new_val
+
+def flip_matrix_horizontal(matrix):
+    """Flips a 3x3 grid horizontally (left column becomes right column)."""
+    return [row[::-1] for row in matrix]
+
+def render_logged_face_window(face_size=120):
+    """
+    Renders all 6 faces in a standard 2D unfolded cross layout:
+             [Up (White)]
+    [Left(Orange)] [Front(Green)] [Right(Red)] [Back(Blue)]
+            [Down (Yellow)]
+    """
+    cell_size = face_size // 3
+    # Grid is 4 faces wide and 3 faces tall
+    canvas_w = face_size * 4
+    canvas_h = face_size * 3
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+
+    # Map face names to grid coordinates (col, row) on the 2D unfolded layout
+    LAYOUT_MAP = {
+        'White':  (1, 0),  # Up
+        'Orange': (0, 1),  # Left
+        'Green':  (1, 1),  # Front
+        'Red':    (2, 1),  # Right
+        'Blue':   (3, 1),  # Back
+        'Yellow': (1, 2)   # Down
+    }
+
+    for center_color, (grid_col, grid_row) in LAYOUT_MAP.items():
+        face_x = grid_col * face_size
+        face_y = grid_row * face_size
+        face_grid = CUBE_STATE[center_color]
+
+        # Draw Face Border & Label
+        cv2.rectangle(canvas, (face_x, face_y), (face_x + face_size, face_y + face_size), (150, 150, 150), 2)
+        
+        # Highlight active scanning face with a thick colored border
+        if CURRENT_CENTER == center_color:
+            cv2.rectangle(canvas, (face_x - 2, face_y - 2), (face_x + face_size + 2, face_y + face_size + 2), (0, 255, 255), 3)
+
+        for r in range(3):
+            for c in range(3):
+                color_name = face_grid[r][c]
+                x1 = face_x + (c * cell_size)
+                y1 = face_y + (r * cell_size)
+                x2 = x1 + cell_size
+                y2 = y1 + cell_size
+
+                if color_name in DRAW_COLORS and color_name != 'Unknown':
+                    fill_color = DRAW_COLORS[color_name]
+                    cv2.rectangle(canvas, (x1 + 3, y1 + 3), (x2 - 3, y2 - 3), fill_color, -1)
+                    text_color = (0, 0, 0) if color_name in ['White', 'Yellow'] else (255, 255, 255)
+                    display_char = color_name[0]
+                else:
+                    text_color = (180, 105, 255) if color_name == 'Obstructed' else (100, 100, 100)
+                    display_char = 'X' if color_name == 'Obstructed' else '?'
+
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), (60, 60, 60), 1)
+                cv2.putText(canvas, display_char, (x1 + (cell_size // 2) - 5, y1 + (cell_size // 2) + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1)
+
+    cv2.imshow("Cube Master State (6 Faces)", canvas)
+    cv2.moveWindow("Cube Master State (6 Faces)", 1000, 50)
+
+
+def sample_colors_inside_quad(photo_img, quad_pts, warp_size=240):
+    dst_pts = np.float32([[0, 0], [warp_size, 0], [warp_size, warp_size], [0, warp_size]])
+    M = cv2.getPerspectiveTransform(quad_pts.astype(np.float32), dst_pts)
+    flat_face = cv2.warpPerspective(photo_img, M, (warp_size, warp_size))
+    hsv_face = cv2.cvtColor(flat_face, cv2.COLOR_BGR2HSV)
+
+    cell_size = warp_size // 3
+    margin = int(cell_size * 0.35)
+
+    current_frame_grid = [['Unknown' for _ in range(3)] for _ in range(3)]
+
+    for r in range(3):
+        for c in range(3):
+            x_start, y_start = c * cell_size, r * cell_size
+            
+            bgr_patch = flat_face[
+                y_start + margin : y_start + cell_size - margin,
+                x_start + margin : x_start + cell_size - margin
+            ]
+            hsv_patch = hsv_face[
+                y_start + margin : y_start + cell_size - margin,
+                x_start + margin : x_start + cell_size - margin
+            ]
+
+            total_patch_pixels = bgr_patch.shape[0] * bgr_patch.shape[1]
+
+            white_mask = cv2.inRange(hsv_patch, np.array([0, 0, 150]), np.array([180, 60, 255]))
+            white_pixel_ratio = cv2.countNonZero(white_mask) / total_patch_pixels
+
+            if white_pixel_ratio > 0.50:
+                is_finger = False
+                candidate_color = 'White'
+            else:
+                skin_mask = get_skin_mask(bgr_patch)
+                skin_ratio = cv2.countNonZero(skin_mask) / total_patch_pixels
+                avg_std_dev, laplacian_var = check_patch_texture_and_variance(bgr_patch)
+
+                is_finger = (skin_ratio > 0.35) or (avg_std_dev > 45.0 and laplacian_var > 220.0)
+
+            if is_finger:
+                candidate_color = 'Obstructed'
+            elif white_pixel_ratio <= 0.50:
+                color_pixel_counts = {}
+                skin_mask = get_skin_mask(bgr_patch)
+
+                for col_name, ranges in COLOR_RANGES_HSV.items():
+                    mask = np.zeros(hsv_patch.shape[:2], dtype=np.uint8)
+                    for (lower, upper) in ranges:
+                        mask = cv2.bitwise_or(mask, cv2.inRange(hsv_patch, np.array(lower), np.array(upper)))
+                    
+                    clean_mask = cv2.bitwise_and(mask, cv2.bitwise_not(skin_mask))
+                    color_pixel_counts[col_name] = cv2.countNonZero(clean_mask)
+
+                candidate_color = max(color_pixel_counts, key=color_pixel_counts.get)
+                max_pixels = color_pixel_counts[candidate_color]
+
+                if (max_pixels / total_patch_pixels) < 0.15:
+                    candidate_color = 'Unknown'
+
+                if candidate_color in ['Red', 'Orange']:
+                    clean_hsv_patch = cv2.bitwise_and(hsv_patch, hsv_patch, mask=cv2.bitwise_not(skin_mask))
+                    hue_pixels = clean_hsv_patch[:, :, 0][clean_hsv_patch[:, :, 0] > 0]
+
+                    if len(hue_pixels) > 0:
+                        mean_hue = np.mean(hue_pixels)
+                        if 7.5 <= mean_hue <= 22.0:
+                            candidate_color = 'Orange'
+                        elif mean_hue < 7.5 or mean_hue > 165.0:
+                            candidate_color = 'Red'
+
+            current_frame_grid[r][c] = candidate_color
+
+            if candidate_color == 'Obstructed':
+                draw_bgr = (180, 105, 255)
+                display_char = 'X'
+            else:
+                draw_bgr = DRAW_COLORS.get(candidate_color, (128, 128, 128))
+                display_char = candidate_color[0]
+
+            cv2.rectangle(flat_face, (x_start, y_start), 
+                          (x_start + cell_size, y_start + cell_size), (0, 255, 0), 1)
+            cv2.putText(flat_face, display_char, 
+                        (x_start + (cell_size // 2) - 8, y_start + (cell_size // 2) + 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, draw_bgr, 2)
+
+
+    # Flip the scanned matrix horizontally to correct camera/mirror orientation
+    current_frame_grid = flip_matrix_horizontal(current_frame_grid)
+    
+    auto_align_and_merge(current_frame_grid)
+    render_logged_face_window()
+
+    return flat_face
+
+# Initialize 6-face layout GUI
+render_logged_face_window()
+
+# --- INTERACTIVE MAIN LOOP ---
+cv2.namedWindow("Main Feed")
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+
+    frame = cv2.flip(frame, 1)
+    h_frame, w_frame, _ = frame.shape
+    display_frame = frame.copy()
+
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord('b'):
+        yolo_active = True
+        print("YOLO Activated.")
+
+    elif key == ord('p'):
+        if yolo_active and latest_roi is not None:
+            snapped_photo = latest_roi.copy()
+            detected_quad_corners = None
+            f_press_count = 0
+            render_logged_face_window()
+
+            roi_display = cv2.resize(snapped_photo, (300, 300))
+            cv2.putText(roi_display, "Photo Snapped. Press 'f'", (10, 25), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.imshow("Snapped Photo", roi_display)
+            cv2.waitKey(1)
+
+    elif key == ord('f'):
+        if snapped_photo is not None:
+            f_press_count += 1
+            fresh_render = snapped_photo.copy()
+            
+            stickers = find_all_stickers(fresh_render, strictness_level=f_press_count % 3)
+
+            if len(stickers) > 0:
+                for s in stickers:
+                    cx, cy = int(s['center'][0]), int(s['center'][1])
+                    cv2.circle(fresh_render, (cx, cy), 4, (0, 255, 255), -1)
+
+                new_corners = reconstruct_quad_from_facelet_vectors(stickers)
+
+                if detected_quad_corners is not None and f_press_count > 1:
+                    detected_quad_corners = (detected_quad_corners * 0.4) + (new_corners * 0.6)
+                else:
+                    detected_quad_corners = new_corners
+
+                cv2.polylines(fresh_render, [detected_quad_corners.astype(np.int32)], True, (0, 255, 0), 2)
+                status_msg = f"Refinement #{f_press_count}: {len(stickers)} facelets"
+
+                warped_color_face = sample_colors_inside_quad(snapped_photo, detected_quad_corners)
+                cv2.imshow("Warped Color View", cv2.resize(warped_color_face, (300, 300)))
+            else:
+                status_msg = f"Refinement #{f_press_count}: Filtering too high"
+
+            roi_display = cv2.resize(fresh_render, (300, 300))
+            cv2.putText(roi_display, status_msg, (10, 25), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.imshow("Snapped Photo", roi_display)
+            cv2.waitKey(1)
+
+    elif key == ord('c'):
+        if snapped_photo is not None and detected_quad_corners is not None:
+            warped_color_face = sample_colors_inside_quad(snapped_photo, detected_quad_corners)
+            cv2.imshow("Warped Color View", cv2.resize(warped_color_face, (300, 300)))
+            cv2.waitKey(1)
+
+    elif key == ord('r'):
+        yolo_active = False
+        latest_roi = None
+        snapped_photo = None
+        detected_quad_corners = None
+        f_press_count = 0
+        CURRENT_CENTER = None
+        CUBE_STATE = {col: [['Unknown']*3 for _ in range(3)] for col in DRAW_COLORS if col != 'Unknown'}
+        cv2.destroyAllWindows()
+        cv2.namedWindow("Main Feed")
+
+    elif key == ord('q'):
+        break
+
+    if yolo_active:
+        try:
+            results = model(frame, device="mps", conf=0.40, verbose=False)
+        except Exception:
+            results = model(frame, conf=0.40, verbose=False)
+
+        boxes = results[0].boxes
+        if len(boxes) > 0:
+            boxes_cpu = boxes.xyxy.cpu().numpy().astype(int)
+            best_box = boxes_cpu[np.argmax([(b[2]-b[0])*(b[3]-b[1]) for b in boxes_cpu])]
+
+            pad = 15
+            x1, y1 = max(0, best_box[0] - pad), max(0, best_box[1] - pad)
+            x2, y2 = min(w_frame, best_box[2] + pad), min(h_frame, best_box[3] + pad)
+
+            latest_roi = frame[y1:y2, x1:x2].copy()
+            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 165, 0), 2)
+
+    cv2.imshow("Main Feed", display_frame)
+
+cap.release()
+cv2.destroyAllWindows()

@@ -1,0 +1,135 @@
+import cv2
+import numpy as np
+import glob
+from ultralytics import YOLO
+
+# --- LOAD MODEL ---
+weights_list = glob.glob("runs/segment/rubiks_seg_model/weights/best.pt")
+MODEL_PATH = weights_list[0] if weights_list else "yolov8n-seg.pt"
+model = YOLO(MODEL_PATH)
+
+cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
+
+# Tracker variables
+face1_corners = None  # 4 corners of primary face [TL, TR, BR, BL]
+prev_gray = None
+
+def order_quad_corners(pts):
+    """Orders points: Top-Left, Top-Right, Bottom-Right, Bottom-Left."""
+    pts = pts.reshape(4, 2).astype(np.float32)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1)
+
+    rect = np.zeros((4, 2), dtype=np.float32)
+    rect[0] = pts[np.argmin(s)]       # TL
+    rect[2] = pts[np.argmax(s)]       # BR
+    rect[1] = pts[np.argmin(diff)]    # TR
+    rect[3] = pts[np.argmax(diff)]    # BL
+    return rect
+
+def warp_and_mesh(frame, quad_pts, window_name="Face Mesh"):
+    """Warps a 4-point face quad into a flat 180x180 3x3 grid window."""
+    dst_pts = np.float32([[0, 0], [179, 0], [179, 179], [0, 179]])
+    M = cv2.getPerspectiveTransform(quad_pts, dst_pts)
+    warped = cv2.warpPerspective(frame, M, (180, 180))
+
+    step = 180 // 3
+    for i in range(1, 3):
+        cv2.line(warped, (i * step, 0), (i * step, 180), (255, 255, 255), 1)
+        cv2.line(warped, (0, i * step), (180, i * step), (255, 255, 255), 1)
+
+    for r in range(3):
+        for c in range(3):
+            cx, cy = int((c + 0.5) * step), int((r + 0.5) * step)
+            cv2.circle(warped, (cx, cy), 3, (0, 0, 255), -1)
+
+    cv2.imshow(window_name, warped)
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+
+    frame = cv2.flip(frame, 1)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    display_frame = frame.copy()
+
+    results = model(frame, conf=0.15, verbose=False)[0]
+
+    # --- 1. INITIAL ANCHORING (Press 'c' when facing camera directly) ---
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('c') and results.masks is not None:
+        # Take largest mask as Face 1 anchor
+        largest_mask = max(results.masks.xy, key=lambda m: len(m))
+        rect = cv2.minAreaRect(largest_mask)
+        box = cv2.boxPoints(rect)
+        face1_corners = order_quad_corners(box)
+        print("-> Face 1 Anchored! Tilt the cube now.")
+
+    if key == ord('r'):
+        face1_corners = None
+        print("-> Reset Tracker.")
+
+    # --- 2. OPTICAL FLOW TRACKING OF FACE 1 ---
+    if face1_corners is not None and prev_gray is not None:
+        p1, st, err = cv2.calcOpticalFlowPyrLK(
+            prev_gray, gray, face1_corners, None, winSize=(21, 21), maxLevel=2
+        )
+        if st.sum() == 4:
+            face1_corners = p1
+
+    prev_gray = gray.copy()
+
+    # --- 3. EXTRAPOLATE ADJACENT FACES TO MASK BOUNDARY ---
+    if face1_corners is not None:
+        # Draw tracked Anchor Face 1
+        cv2.polylines(display_frame, [face1_corners.astype(np.int32)], True, (0, 255, 0), 2)
+        cv2.putText(display_frame, "Face 1 (Anchor)", 
+                    (int(face1_corners[0][0]), int(face1_corners[0][1] - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
+        try:
+            warp_and_mesh(frame, face1_corners, "Face 1 Mesh")
+        except Exception:
+            pass
+
+        # If overall cube YOLO mask exists, project Face 2 from Right Hinge
+        if results.masks is not None:
+            all_pts = np.vstack(results.masks.xy).astype(np.float32)
+            
+            # Hinge edge: Right side of Face 1 [TR, BR]
+            tr, br = face1_corners[1], face1_corners[2]
+
+            # Find points in overall mask that lie furthest to the right of the hinge
+            right_points = all_pts[all_pts[:, 0] > max(tr[0], br[0])]
+            
+            if len(right_points) > 5:
+                # Find upper-right and lower-right extreme boundary points
+                far_tr = right_points[np.argmin(right_points[:, 1])] # Top-most right point
+                far_br = right_points[np.argmax(right_points[:, 1])] # Bottom-most right point
+
+                # Build Face 2 Quad from Face 1's right hinge + outer mask points
+                face2_quad = np.array([tr, far_tr, far_br, br], dtype=np.float32)
+
+                # Draw Extrapolated Face 2
+                cv2.polylines(display_frame, [face2_quad.astype(np.int32)], True, (0, 165, 255), 2)
+                cv2.putText(display_frame, "Face 2 (Extrapolated)", 
+                            (int(far_tr[0]), int(far_tr[1] - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+
+                try:
+                    warp_and_mesh(frame, face2_quad, "Face 2 Mesh")
+                except Exception:
+                    pass
+
+    # Instructions overlay
+    if face1_corners is None:
+        cv2.putText(display_frame, "Show 1 Face Straight-On and Press 'C' to Lock Anchor", 
+                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+    cv2.imshow("Hinge-Extrapolation Tracker", display_frame)
+    if key == ord('q'): break
+
+cap.release()
+cv2.destroyAllWindows()

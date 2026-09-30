@@ -1,0 +1,195 @@
+import csv
+import cv2
+import numpy as np
+from datetime import datetime
+from ultralytics import YOLO
+
+# -------------------------------------------------------------------
+# CONFIGURATION & COLOR SETUP
+# -------------------------------------------------------------------
+MODEL_PATH = "runs/pose/train-3/weights/best.pt"
+LOG_FILE = "cube_log.csv"
+
+# HSV Color ranges for Rubik's Cube stickers
+HSV_RANGES = {
+    "Red": [
+        ((0, 120, 70), (10, 255, 255)),
+        ((170, 120, 70), (180, 255, 255)),
+    ],
+    "Orange": [((11, 120, 70), (25, 255, 255))],
+    "Yellow": [((26, 120, 70), (35, 255, 255))],
+    "Green": [((36, 120, 70), (85, 255, 255))],
+    "Blue": [((86, 120, 70), (130, 255, 255))],
+    "White": [((0, 0, 150), (180, 50, 255))],
+}
+
+# -------------------------------------------------------------------
+# HELPER FUNCTIONS
+# -------------------------------------------------------------------
+def initialize_logger():
+    """Creates the CSV file with headers if it does not exist."""
+    try:
+        with open(LOG_FILE, "x", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "Mode", "Top_Color", "Left_Color", "Right_Color", "FPS"])
+    except FileExistsError:
+        pass
+
+
+def log_entry(mode, top_c="N/A", left_c="N/A", right_c="N/A", fps=0.0):
+    """Appends a new detection record to the CSV log."""
+    with open(LOG_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        writer.writerow([timestamp, mode, top_c, left_c, right_c, f"{fps:.1f}"])
+
+
+def refine_point_with_contours(img, pt, window_size=12):
+    """Snaps YOLO keypoint to the nearest local physical edge."""
+    h, w = img.shape[:2]
+    x, y = int(pt[0]), int(pt[1])
+
+    x1, y1 = max(0, x - window_size), max(0, y - window_size)
+    x2, y2 = min(w, x + window_size), min(h, y + window_size)
+    roi = img[y1:y2, x1:x2]
+
+    if roi.size == 0:
+        return pt
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 40, 120)
+    contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    if contours:
+        all_pts = np.vstack(contours).squeeze(axis=1) + np.array([x1, y1])
+        dists = np.linalg.norm(all_pts - np.array([x, y]), axis=1)
+        min_idx = np.argmin(dists)
+        if dists[min_idx] < 10:
+            return all_pts[min_idx]
+
+    return pt
+
+
+def detect_face_color(frame_hsv, polygon_pts):
+    """Classifies the dominant HSV color inside a face polygon."""
+    mask = np.zeros(frame_hsv.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [polygon_pts], 255)
+
+    # Calculate average HSV inside polygon
+    mean_val = cv2.mean(frame_hsv, mask=mask)[:3]
+    h, s, v = mean_val
+
+    for color_name, ranges in HSV_RANGES.items():
+        for lower, upper in ranges:
+            if (lower[0] <= h <= upper[0]) and (lower[1] <= s <= upper[1]) and (lower[2] <= v <= upper[2]):
+                return color_name
+    return "Unknown"
+
+# -------------------------------------------------------------------
+# MAIN ENGINE
+# -------------------------------------------------------------------
+initialize_logger()
+model = YOLO(MODEL_PATH)
+
+cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
+
+prev_time = cv2.getTickCount()
+
+print("Master Pipeline Active... Press [Q] to quit.")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    overlay = frame.copy()
+    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # Calculate FPS
+    curr_time = cv2.getTickCount()
+    fps = cv2.getTickFrequency() / (curr_time - prev_time)
+    prev_time = curr_time
+
+    results = model(frame, conf=0.35, verbose=False)
+
+    top_color, left_color, right_color = "N/A", "N/A", "N/A"
+    mode_str = "No Cube"
+
+    for r in results:
+        if r.boxes is not None and len(r.boxes) > 0:
+            box = r.boxes.xyxy[0].cpu().numpy().astype(int)
+            bx1, by1, bx2, by2 = max(0, box[0]), max(0, box[1]), box[2], box[3]
+
+            has_kpts = False
+            if r.keypoints is not None and len(r.keypoints) > 0:
+                kpts = r.keypoints.xy[0].cpu().numpy()
+                if len([p for p in kpts if not np.all(p == 0)]) >= 4:
+                    has_kpts = True
+
+            # --- MODE 1: 3-FACE SKELETON + CONTOUR SNAP + COLOR ---
+            if has_kpts:
+                mode_str = "YOLO+Contour (3 Face)"
+                refined_pts = [refine_point_with_contours(frame, pt) if not np.all(pt == 0) else pt for pt in kpts]
+                pts = np.array(refined_pts, dtype=np.int32)
+
+                k0, k1, k2, k3, k4, k5, k6 = pts[0], pts[1], pts[2], pts[3], pts[4], pts[5], pts[6]
+
+                top_face = np.array([k0, k1, k2, k3], dtype=np.int32)
+                right_face = np.array([k0, k3, k4, k5], dtype=np.int32)
+                left_face = np.array([k0, k5, k6, k1], dtype=np.int32)
+
+                # Color classification
+                top_color = detect_face_color(hsv_frame, top_face)
+                right_color = detect_face_color(hsv_frame, right_face)
+                left_color = detect_face_color(hsv_frame, left_face)
+
+                # Render polygons and color text labels
+                faces = [(top_face, top_color), (left_face, left_color), (right_face, right_color)]
+                for face_pts, color_txt in faces:
+                    if not np.any(face_pts == 0):
+                        cv2.fillPoly(overlay, [face_pts], (180, 180, 180))
+                        cv2.polylines(frame, [face_pts], True, (255, 255, 255), 2)
+                        
+                        # Label text at face centroid
+                        M = cv2.moments(face_pts)
+                        if M["m00"] != 0:
+                            cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+                            cv2.putText(frame, color_txt, (cx - 20, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+            # --- MODE 2: 1-FACE CONTOUR FALLBACK + COLOR ---
+            else:
+                mode_str = "Contour Fallback (1 Face)"
+                roi = frame[by1:by2, bx1:bx2]
+                if roi.size > 0:
+                    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 30, 100)
+                    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                    if contours:
+                        largest_c = max(contours, key=cv2.contourArea)
+                        if cv2.contourArea(largest_c) > 500:
+                            peri = cv2.arcLength(largest_c, True)
+                            approx = cv2.approxPolyDP(largest_c, 0.04 * peri, True)
+                            approx_global = approx + np.array([bx1, by1])
+
+                            top_color = detect_face_color(hsv_frame, approx_global)
+                            cv2.fillPoly(overlay, [approx_global], (0, 255, 255))
+                            cv2.polylines(frame, [approx_global], True, (255, 255, 255), 2)
+
+    # Log detections to CSV
+    if mode_str != "No Cube":
+        log_entry(mode_str, top_color, left_color, right_color, fps)
+
+    # Render frame UI
+    cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
+    cv2.putText(frame, f"FPS: {fps:.1f} | Mode: {mode_str}", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    cv2.imshow("Master Rubik's Pipeline", frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

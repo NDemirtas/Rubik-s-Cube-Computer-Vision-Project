@@ -1,0 +1,26 @@
+import cv2
+
+# Try camera index 0 first; if it opens your Mac's built-in webcam, change 0 to 1
+cap = cv2.VideoCapture(0)
+
+if not cap.isOpened():
+    print("Error: Could not open camera.")
+    exit()
+
+print("Camera feed started. Press 'q' on your keyboard to quit.")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Failed to grab frame.")
+        break
+
+    # Display the live video feed in a window
+    cv2.imshow("iPhone Live Feed - Rubik's Cube CV", frame)
+
+    # Press 'q' to stop the video loop
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

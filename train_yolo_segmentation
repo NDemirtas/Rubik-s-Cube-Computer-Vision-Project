@@ -1,0 +1,41 @@
+import os
+import sys
+
+# 1. Force Python and PyTorch to use a dedicated local temporary directory
+LOCAL_TMP = os.path.abspath("./tmp")
+os.makedirs(LOCAL_TMP, exist_ok=True)
+os.environ["TMPDIR"] = LOCAL_TMP
+os.environ["TEMP"] = LOCAL_TMP
+os.environ["TMP"] = LOCAL_TMP
+
+import glob
+from ultralytics import YOLO
+
+# 2. Path to your downloaded YOLOv8 dataset
+DATASET_DIR = "YOLOv8-seg-Multiple-Face-Track-Custom"  # Ensure this matches your downloaded folder name
+data_yaml = os.path.abspath(f"{DATASET_DIR}/data.yaml")
+
+# 3. Clear cache
+for c in glob.glob(f"{DATASET_DIR}/**/*.cache", recursive=True):
+    try:
+        os.remove(c)
+    except OSError:
+        pass
+
+# 4. Train Segmentation Model
+model = YOLO("yolov8n-seg.pt")
+
+results = model.train(
+    data=data_yaml,
+    epochs=30,
+    imgsz=640,
+    batch=8,
+    device="mps",
+    single_cls=True,
+    project="runs/segment",
+    name="rubiks_seg_model",
+    exist_ok=True
+)
+
+print("\nSegmentation Training Complete!")
+print("Best weights saved at: runs/segment/rubiks_seg_model/weights/best.pt")

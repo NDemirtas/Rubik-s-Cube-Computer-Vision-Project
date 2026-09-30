@@ -1,0 +1,478 @@
+from collections import deque
+import glob
+import time
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+COLOR_DELTA_THRESHOLD = 24.0  # HSV color distance threshold
+CUBE_SHIFT_THRESHOLD = 40.0   # Filter out entire cube translations
+
+# STABILITY PRINT LOGIC
+CONFIDENCE_THRESHOLD = 60.0   # Min score needed to count as active
+REQUIRED_STABLE_FRAMES = 2   # Frames top move must stay highest to trigger print
+COOLDOWN_FRAMES = 15          # Wait duration after print before logging again
+
+FACELET_ANCHORS = {
+    "TL": (0, 0, np.array([0.18, 0.18], dtype=np.float32)),
+    "TC": (0, 1, np.array([0.50, 0.18], dtype=np.float32)),
+    "TR": (0, 2, np.array([0.82, 0.18], dtype=np.float32)),
+    "ML": (1, 0, np.array([0.18, 0.50], dtype=np.float32)),
+    "MC": (1, 1, np.array([0.50, 0.50], dtype=np.float32)),
+    "MR": (1, 2, np.array([0.82, 0.50], dtype=np.float32)),
+    "BL": (2, 0, np.array([0.18, 0.82], dtype=np.float32)),
+    "BC": (2, 1, np.array([0.50, 0.82], dtype=np.float32)),
+    "BR": (2, 2, np.array([0.82, 0.82], dtype=np.float32)),
+}
+
+# ==========================================
+# STATE TRACKING
+# ==========================================
+PREV_GRAY = None
+PREV_ANCHOR_PTS = None
+
+START_COLORS = {}
+COLOR_DELTAS = {name: 0.0 for name in FACELET_ANCHORS}
+FACELET_VECTORS = {name: np.array([0.0, 0.0]) for name in FACELET_ANCHORS}
+
+# Continuous Frame Stability Tracker
+CURRENT_TOP_MOVE = "NONE"
+CONSECUTIVE_FRAME_COUNT = 0
+COOLDOWN_COUNTER = 0
+
+CANDIDATE_SCORES = []
+MOVE_HISTORY = deque(maxlen=6)
+
+
+# ==========================================
+# MOTION DETECTOR GATE
+# ==========================================
+class MotionFailsafeDetector:
+    def __init__(self, color_delta_threshold=24.0, min_motion_pixels=150):
+        self.color_delta_threshold = color_delta_threshold
+        self.min_motion_pixels = min_motion_pixels
+        self.outer_keys = ["TL", "TC", "TR", "ML", "MR", "BL", "BC", "BR"]
+
+    def process_frame(self, current_gray, prev_gray, color_deltas):
+        if prev_gray is None or current_gray is None:
+            return {"move_detected": False, "category": "NONE", "motion_px": 0}
+
+        outer_active = sum(
+            1
+            for k in self.outer_keys
+            if color_deltas.get(k, 0.0) >= self.color_delta_threshold
+        )
+        mc_changed = color_deltas.get("MC", 0.0) >= self.color_delta_threshold
+
+        frame_diff = cv2.absdiff(current_gray, prev_gray)
+        _, motion_mask = cv2.threshold(frame_diff, 20, 255, cv2.THRESH_BINARY)
+        total_motion_px = cv2.countNonZero(motion_mask)
+
+        if outer_active >= 2 and not mc_changed:
+            return {"move_detected": True, "category": "FRONT_FACE", "motion_px": total_motion_px}
+
+        if mc_changed or outer_active >= 2:
+            return {"move_detected": True, "category": "SLICE", "motion_px": total_motion_px}
+
+        if total_motion_px >= (self.min_motion_pixels * 3):
+            return {"move_detected": True, "category": "CHECK_AGAIN", "motion_px": total_motion_px}
+
+        return {"move_detected": False, "category": "NONE", "motion_px": total_motion_px}
+
+
+FAILSAFE_DETECTOR = MotionFailsafeDetector(COLOR_DELTA_THRESHOLD)
+LAST_MOTION_EVENT = {"category": "NONE", "motion_px": 0}
+
+
+# ==========================================
+# MOVE PAIR SCORE EVALUATOR
+# ==========================================
+def evaluate_move_pair(color_deltas, facelet_vectors, anchors_dict):
+    grid_deltas = np.zeros((3, 3), dtype=np.float32)
+    grid_v = np.zeros((3, 3, 2), dtype=np.float32)
+
+    for name, (r, c, _) in FACELET_ANCHORS.items():
+        grid_deltas[r, c] = color_deltas[name]
+        grid_v[r, c] = facelet_vectors[name]
+
+    color_active_mask = grid_deltas >= COLOR_DELTA_THRESHOLD
+
+    all_vecs = grid_v.reshape(9, 2)
+    global_v = np.median(all_vecs, axis=0)
+    global_mag = np.linalg.norm(global_v)
+
+    if np.sum(color_active_mask) >= 8 and global_mag > CUBE_SHIFT_THRESHOLD:
+        return [("NONE", 100.0)]
+
+    scores = {}
+
+    # 1. ENHANCED FRONT FACE (F / F') EVALUATION
+    center_pt = anchors_dict["MC"]
+    rotational_moments = []
+    f_active_count = 0
+    corner_keys = ["TL", "TR", "BL", "BR"]
+    corner_active_count = sum(1 for k in corner_keys if color_deltas[k] >= COLOR_DELTA_THRESHOLD)
+
+    for name, pt in anchors_dict.items():
+        if name == "MC":
+            continue
+        r_vec = pt - center_pt
+        r_dist = np.linalg.norm(r_vec)
+        if r_dist < 1e-3:
+            continue
+
+        v_vec = facelet_vectors[name] - global_v
+        # Cross product (2D): r_x * v_y - r_y * v_x gives perpendicular angular velocity
+        cross_prod = (r_vec[0] * v_vec[1]) - (r_vec[1] * v_vec[0])
+        tangential_velocity = cross_prod / r_dist
+
+        if color_deltas[name] >= COLOR_DELTA_THRESHOLD:
+            f_active_count += 1
+            rotational_moments.append(tangential_velocity)
+
+    # Re-weighted rotational dynamic score
+    if (f_active_count >= 2 or corner_active_count >= 2) and len(rotational_moments) > 0:
+        avg_rotation = np.mean(rotational_moments)
+        rot_score = min(abs(avg_rotation) / 1.5, 1.0) * 60.0
+        
+        # Color distribution score for ring activity around static center
+        outer_color_coverage = (f_active_count / 8.0) * 40.0
+        center_stability_bonus = 1.2 if color_deltas["MC"] < COLOR_DELTA_THRESHOLD else 0.8
+        
+        scores["F / F' Move"] = min((rot_score + outer_color_coverage) * center_stability_bonus, 100.0)
+    else:
+        scores["F / F' Move"] = 0.0
+
+    # 2. RIGHT SLICE (R / R')
+    r_col_active = np.mean(color_active_mask[:, 2])
+    l_col_idle = 1.0 - np.mean(color_active_mask[:, 0])
+    r_mag = min(abs(np.mean(grid_v[:, 2, 1] - global_v[1])) / 4.0, 1.0)
+    scores["R / R' Move"] = ((r_col_active * 0.45) + (l_col_idle * 0.35) + (r_mag * 0.20)) * 100.0
+
+    # 3. LEFT SLICE (L / L')
+    l_col_active = np.mean(color_active_mask[:, 0])
+    r_col_idle = 1.0 - np.mean(color_active_mask[:, 2])
+    l_mag = min(abs(np.mean(grid_v[:, 0, 1] - global_v[1])) / 4.0, 1.0)
+    scores["L / L' Move"] = ((l_col_active * 0.45) + (r_col_idle * 0.35) + (l_mag * 0.20)) * 100.0
+
+    # 4. UP SLICE (U / U')
+    u_row_active = np.mean(color_active_mask[0, :])
+    d_row_idle = 1.0 - np.mean(color_active_mask[2, :])
+    u_mag = min(abs(np.mean(grid_v[0, :, 0] - global_v[0])) / 4.0, 1.0)
+    scores["U / U' Move"] = ((u_row_active * 0.45) + (d_row_idle * 0.35) + (u_mag * 0.20)) * 100.0
+
+    # 5. DOWN SLICE (D / D')
+    d_row_active = np.mean(color_active_mask[2, :])
+    u_row_idle = 1.0 - np.mean(color_active_mask[0, :])
+    d_mag = min(abs(np.mean(grid_v[2, :, 0] - global_v[0])) / 4.0, 1.0)
+    scores["D / D' Move"] = ((d_row_active * 0.45) + (u_row_idle * 0.35) + (d_mag * 0.20)) * 100.0
+
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+def order_quad_points(pts):
+    pts = pts.reshape((4, 2))
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+def compute_anchor_pixel_positions(quad_corners):
+    src_quad = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(src_quad, quad_corners.astype(np.float32))
+
+    pts_norm = np.array([[v[2] for v in FACELET_ANCHORS.values()]], dtype=np.float32)
+    pts_pix = cv2.perspectiveTransform(pts_norm, M)[0]
+
+    anchors_dict = {}
+    for name, pt in zip(FACELET_ANCHORS.keys(), pts_pix):
+        anchors_dict[name] = pt
+    return anchors_dict, pts_pix.reshape(-1, 1, 2)
+
+
+def sample_facelet_hsv(frame_hsv, pt, radius=4):
+    h, w, _ = frame_hsv.shape
+    px, py = int(pt[0]), int(pt[1])
+
+    x1, x2 = max(0, px - radius), min(w, px + radius + 1)
+    y1, y2 = max(0, py - radius), min(h, py + radius + 1)
+
+    patch = frame_hsv[y1:y2, x1:x2]
+    if patch.size == 0:
+        return np.array([0, 0, 0], dtype=np.float32)
+
+    return np.mean(patch, axis=(0, 1)).astype(np.float32)
+
+
+def get_color_distance(c1, c2):
+    dh = min(abs(c1[0] - c2[0]), 180 - abs(c1[0] - c2[0])) * 2.0
+    ds = abs(c1[1] - c2[1])
+    dv = abs(c1[2] - c2[2]) * 0.5
+    return np.sqrt(dh**2 + ds**2 + dv**2)
+
+
+def process_color_motion_tracker(frame, yolo_quad_corners):
+    global PREV_GRAY, PREV_ANCHOR_PTS
+    global START_COLORS, COLOR_DELTAS, FACELET_VECTORS
+    global CANDIDATE_SCORES, LAST_MOTION_EVENT
+    global CURRENT_TOP_MOVE, CONSECUTIVE_FRAME_COUNT, COOLDOWN_COUNTER
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    if yolo_quad_corners is None:
+        PREV_GRAY = gray
+        PREV_ANCHOR_PTS = None
+        CONSECUTIVE_FRAME_COUNT = 0
+        return
+
+    anchors_dict, current_pts = compute_anchor_pixel_positions(yolo_quad_corners)
+
+    # Base baseline colors on initial pass
+    if not START_COLORS:
+        for name, pt in anchors_dict.items():
+            START_COLORS[name] = sample_facelet_hsv(hsv, pt)
+
+    # Optical Flow Calculation
+    if (
+        PREV_GRAY is not None
+        and PREV_ANCHOR_PTS is not None
+        and len(PREV_ANCHOR_PTS) == len(current_pts)
+    ):
+        new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            PREV_GRAY,
+            gray,
+            PREV_ANCHOR_PTS,
+            None,
+            winSize=(21, 21),
+            maxLevel=2,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
+        )
+        if new_pts is not None and status is not None:
+            movements = (new_pts - PREV_ANCHOR_PTS).reshape(-1, 2)
+            keys = list(FACELET_ANCHORS.keys())
+            for i, name in enumerate(keys):
+                if status[i] == 1:
+                    FACELET_VECTORS[name] = movements[i]
+                else:
+                    FACELET_VECTORS[name] = np.array([0.0, 0.0])
+
+    # Sample color deltas
+    for name, pt in anchors_dict.items():
+        current_color = sample_facelet_hsv(hsv, pt)
+        COLOR_DELTAS[name] = get_color_distance(START_COLORS[name], current_color)
+
+    LAST_MOTION_EVENT = FAILSAFE_DETECTOR.process_frame(gray, PREV_GRAY, COLOR_DELTAS)
+    PREV_ANCHOR_PTS = current_pts
+    PREV_GRAY = gray
+
+    # Continuous frame stability evaluation
+    CANDIDATE_SCORES = evaluate_move_pair(COLOR_DELTAS, FACELET_VECTORS, anchors_dict)
+
+    if COOLDOWN_COUNTER > 0:
+        COOLDOWN_COUNTER -= 1
+        return
+
+    if CANDIDATE_SCORES:
+        top_move, top_score = CANDIDATE_SCORES[0]
+
+        if top_score >= CONFIDENCE_THRESHOLD and top_move != "NONE":
+            if top_move == CURRENT_TOP_MOVE:
+                CONSECUTIVE_FRAME_COUNT += 1
+            else:
+                CURRENT_TOP_MOVE = top_move
+                CONSECUTIVE_FRAME_COUNT = 1
+
+            # Trigger condition: Candidate holds top spot continuously for required frames
+            if CONSECUTIVE_FRAME_COUNT >= REQUIRED_STABLE_FRAMES:
+                MOVE_HISTORY.append(top_move)
+
+                # Format top 3 candidates string
+                top_3 = CANDIDATE_SCORES[:3]
+                top_3_str = " or ".join(f"{move} ({score:.0f}%)" for move, score in top_3)
+                print(f"[EVENT LOG]: {top_3_str} was made.", flush=True)
+
+                # Reset baselines for color tracker & apply print cooldown
+                for name, pt in anchors_dict.items():
+                    START_COLORS[name] = sample_facelet_hsv(hsv, pt)
+
+                CONSECUTIVE_FRAME_COUNT = 0
+                CURRENT_TOP_MOVE = "NONE"
+                COOLDOWN_COUNTER = COOLDOWN_FRAMES
+        else:
+            CONSECUTIVE_FRAME_COUNT = 0
+            CURRENT_TOP_MOVE = "NONE"
+
+
+def draw_hud(frame, yolo_quad_corners):
+    h, w, _ = frame.shape
+
+    if yolo_quad_corners is not None:
+        cv2.polylines(frame, [yolo_quad_corners.astype(np.int32)], True, (0, 255, 0), 2)
+        anchors_dict, _ = compute_anchor_pixel_positions(yolo_quad_corners)
+
+        for name, pt in anchors_dict.items():
+            px, py = int(pt[0]), int(pt[1])
+            vec = FACELET_VECTORS[name]
+            color_delta = COLOR_DELTAS[name]
+
+            if color_delta >= COLOR_DELTA_THRESHOLD:
+                color = (0, 0, 255)
+                cv2.circle(frame, (px, py), 6, color, -1)
+                end_x = int(px + vec[0] * 4)
+                end_y = int(py + vec[1] * 4)
+                cv2.arrowedLine(frame, (px, py), (end_x, end_y), color, 2, tipLength=0.35)
+            else:
+                cv2.circle(frame, (px, py), 3, (0, 255, 0), -1)
+
+    # Top Status Bar
+    cv2.rectangle(frame, (0, 0), (w, 45), (20, 20, 20), -1)
+
+    status_str = f"STABLE: {CONSECUTIVE_FRAME_COUNT}/{REQUIRED_STABLE_FRAMES}"
+    status_color = (0, 255, 0) if CONSECUTIVE_FRAME_COUNT > 0 else (150, 150, 150)
+    cv2.putText(
+        frame,
+        status_str,
+        (15, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        status_color,
+        2,
+    )
+
+    motion_cat = LAST_MOTION_EVENT.get("category", "NONE")
+    cv2.putText(
+        frame,
+        f"Motion Gate: {motion_cat}",
+        (w // 2 - 80, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 255) if motion_cat != "NONE" else (150, 150, 150),
+        1,
+    )
+
+    history_str = " ".join(list(MOVE_HISTORY)) if len(MOVE_HISTORY) > 0 else "None"
+    cv2.putText(
+        frame,
+        f"History: {history_str}",
+        (w - 320, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+    )
+
+    # Candidate Score HUD Panel
+    panel_w, panel_h = 280, 240
+    px1, py1 = w - panel_w - 15, h - panel_h - 15
+    px2, py2 = w - 15, h - 15
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (px1, py1), (px2, py2), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+    cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 255), 1)
+
+    cv2.putText(
+        frame,
+        "MOVE TYPE CONFIDENCE",
+        (px1 + 10, py1 + 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (200, 200, 200),
+        1,
+    )
+    cv2.line(frame, (px1 + 10, py1 + 28), (px2 - 10, py1 + 28), (60, 60, 60), 1)
+
+    y_offset = py1 + 50
+    top_candidates = CANDIDATE_SCORES[:5] if CANDIDATE_SCORES else [("NONE", 0.0)]
+
+    for idx, (move_name, score) in enumerate(top_candidates):
+        txt_color = (0, 255, 0) if idx == 0 and score >= CONFIDENCE_THRESHOLD else (200, 200, 200)
+        bar_color = (0, 255, 0) if idx == 0 and score >= CONFIDENCE_THRESHOLD else (255, 180, 0)
+
+        cv2.putText(
+            frame,
+            f"{move_name}",
+            (px1 + 10, y_offset),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            txt_color,
+            1,
+        )
+
+        bar_x1 = px1 + 115
+        bar_max_w = 95
+        bar_w = int((score / 100.0) * bar_max_w)
+
+        cv2.rectangle(frame, (bar_x1, y_offset - 8), (bar_x1 + bar_max_w, y_offset + 2), (40, 40, 40), -1)
+        if bar_w > 0:
+            cv2.rectangle(frame, (bar_x1, y_offset - 8), (bar_x1 + bar_w, y_offset + 2), bar_color, -1)
+
+        cv2.putText(
+            frame,
+            f"{score:.0f}%",
+            (bar_x1 + bar_max_w + 6, y_offset),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            txt_color,
+            1,
+        )
+
+        y_offset += 34
+
+
+def main():
+    cap = cv2.VideoCapture(0)
+    weights = glob.glob("runs/segment/rubiks_seg_model/weights/best.pt")
+    model = YOLO(weights[0] if weights else "yolov8n-seg.pt")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1)
+        h_frame, w_frame, _ = frame.shape
+        display = frame.copy()
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+        results = model(frame, conf=0.40, verbose=False)[0]
+        yolo_quad_corners = None
+
+        if results.masks is not None and len(results.masks) > 0:
+            masks = results.masks.data.cpu().numpy()
+            boxes = results.boxes.xyxy.cpu().numpy().astype(int)
+            best_idx = np.argmax([(b[2] - b[0]) * (b[3] - b[1]) for b in boxes])
+
+            mask_resized = cv2.resize(masks[best_idx], (w_frame, h_frame))
+            mask_binary = (mask_resized > 0.5).astype(np.uint8) * 255
+
+            contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                cnt = max(contours, key=cv2.contourArea)
+                peri = cv2.arcLength(cnt, True)
+                approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
+                pts = approx.reshape(4, 2) if len(approx) == 4 else cv2.boxPoints(cv2.minAreaRect(cnt))
+                yolo_quad_corners = order_quad_points(pts)
+
+        process_color_motion_tracker(frame, yolo_quad_corners)
+        draw_hud(display, yolo_quad_corners)
+
+        cv2.imshow("Move Type Evaluator", display)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

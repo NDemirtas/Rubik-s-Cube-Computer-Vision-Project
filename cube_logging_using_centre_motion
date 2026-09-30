@@ -1,0 +1,594 @@
+import glob
+import time
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+# --- CAMERA INITIALIZATION ---
+cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
+
+# --- LOAD YOLO SEGMENTATION MODEL ---
+weights_list = glob.glob("runs/segment/rubiks_seg_model/weights/best.pt")
+MODEL_PATH = weights_list[0] if weights_list else "yolov8n-seg.pt"
+model = YOLO(MODEL_PATH)
+
+# --- HSV COLOR RANGES ---
+COLOR_RANGES_HSV = {
+    "Red": [
+        ((0, 150, 60), (6, 255, 255)),
+        ((168, 150, 60), (180, 255, 255)),
+    ],
+    "Orange": [((7, 140, 60), (22, 255, 255))],
+    "Yellow": [((23, 80, 100), (38, 255, 255))],
+    "Green": [((39, 80, 60), (85, 255, 255))],
+    "Blue": [((86, 80, 60), (125, 255, 255))],
+    "White": [((0, 0, 150), (180, 60, 255))],
+}
+
+DRAW_COLORS = {
+    "White": (240, 240, 240),
+    "Yellow": (0, 235, 235),
+    "Red": (0, 0, 220),
+    "Orange": (0, 140, 255),
+    "Blue": (220, 0, 0),
+    "Green": (0, 200, 0),
+    "Unknown": (60, 60, 60),
+}
+
+VALID_COLORS = ["White", "Yellow", "Red", "Orange", "Green", "Blue"]
+
+# BOY Spatial Adjacency Table: [TOP, RIGHT, BOTTOM, LEFT]
+BOY_NEIGHBORS = {
+    "Green": ["White", "Red", "Yellow", "Orange"],
+    "Red": ["White", "Blue", "Yellow", "Green"],
+    "Blue": ["White", "Orange", "Yellow", "Red"],
+    "Orange": ["White", "Green", "Yellow", "Blue"],
+    "White": ["Blue", "Red", "Green", "Orange"],
+    "Yellow": ["Green", "Red", "Blue", "Orange"],
+}
+
+# Master Cube State
+CUBE_STATE = {
+    col: [
+        ["Unknown", "Unknown", "Unknown"],
+        ["Unknown", col, "Unknown"],
+        ["Unknown", "Unknown", "Unknown"],
+    ]
+    for col in VALID_COLORS
+}
+
+CUBE_VOTES = {
+    col: [[[] for _ in range(3)] for _ in range(3)] for col in VALID_COLORS
+}
+
+# --- TRACKING STATES ---
+INITIAL_FACE_LOGGED = False
+LAST_STABLE_COLOR = None
+CURRENT_CENTER = None
+
+HUD_LAST_MOTION_MSG = "SEARCHING FOR FIRST FACE..."
+HUD_LAST_ROTATION_STEPS = 0
+
+# --- SPARSE OPTICAL FLOW TRACKING ---
+PREV_GRAY_SMALL = None
+TRACKED_POINTS = None
+OPTICAL_FLOW_VECTOR = (0.0, 0.0)
+DETECTED_EXIT_DIR = "NONE"
+SMOOTH_FLOW = np.array([0.0, 0.0])
+
+LK_PARAMS = dict(
+    winSize=(15, 15),
+    maxLevel=2,
+    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
+)
+FEATURE_PARAMS = dict(
+    maxCorners=40, qualityLevel=0.3, minDistance=7, blockSize=7
+)
+
+VOTE_WINDOW_SIZE = 4
+last_auto_process_time = 0.0
+AUTO_PROCESS_INTERVAL = 0.15
+
+
+def order_quad_points(pts):
+    pts = pts.reshape((4, 2))
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+def rotate_matrix_90_cw(matrix):
+    return [list(row) for row in zip(*matrix[::-1])]
+
+
+def flip_matrix_horizontal(matrix):
+    return [row[::-1] for row in matrix]
+
+
+def calculate_centroid(quad_pts):
+    cx = int(np.mean(quad_pts[:, 0]))
+    cy = int(np.mean(quad_pts[:, 1]))
+    return cx, cy
+
+
+def calculate_fast_sparse_flow(frame, quad_mask):
+    global PREV_GRAY_SMALL, TRACKED_POINTS, OPTICAL_FLOW_VECTOR, DETECTED_EXIT_DIR, SMOOTH_FLOW
+
+    h, w = frame.shape[:2]
+    scale = 0.25
+    small_w, small_h = int(w * scale), int(h * scale)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray_small = cv2.resize(gray, (small_w, small_h))
+
+    if PREV_GRAY_SMALL is None:
+        PREV_GRAY_SMALL = gray_small
+        return (0.0, 0.0), "NONE"
+
+    small_mask = None
+    if quad_mask is not None:
+        small_mask = cv2.resize(
+            quad_mask, (small_w, small_h), interpolation=cv2.INTER_NEAREST
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        small_mask = cv2.erode(small_mask, kernel)
+
+    if TRACKED_POINTS is None or len(TRACKED_POINTS) < 8:
+        if small_mask is not None and np.any(small_mask > 0):
+            pts = cv2.goodFeaturesToTrack(
+                gray_small, mask=small_mask, **FEATURE_PARAMS
+            )
+            if pts is not None:
+                TRACKED_POINTS = pts
+
+    raw_dx, raw_dy = 0.0, 0.0
+    if TRACKED_POINTS is not None and len(TRACKED_POINTS) > 0:
+        new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            PREV_GRAY_SMALL, gray_small, TRACKED_POINTS, None, **LK_PARAMS
+        )
+
+        if new_pts is not None and status is not None:
+            good_new = new_pts[status == 1]
+            good_old = TRACKED_POINTS[status == 1]
+
+            if len(good_new) > 0:
+                movements = (good_new - good_old) / scale
+                raw_dx = np.median(movements[:, 0])
+                raw_dy = np.median(movements[:, 1])
+                TRACKED_POINTS = good_new.reshape(-1, 1, 2)
+
+    PREV_GRAY_SMALL = gray_small
+
+    raw_vec = np.array([raw_dx, raw_dy])
+    SMOOTH_FLOW = 0.3 * raw_vec + 0.7 * SMOOTH_FLOW
+    OPTICAL_FLOW_VECTOR = (float(SMOOTH_FLOW[0]), float(SMOOTH_FLOW[1]))
+
+    dx, dy = OPTICAL_FLOW_VECTOR
+    mag = np.sqrt(dx**2 + dy**2)
+
+    if mag > 2.5:
+        if abs(dx) > abs(dy):
+            DETECTED_EXIT_DIR = "RIGHT" if dx > 0 else "LEFT"
+        else:
+            DETECTED_EXIT_DIR = "BOTTOM" if dy > 0 else "TOP"
+    else:
+        DETECTED_EXIT_DIR = "NONE"
+
+    return OPTICAL_FLOW_VECTOR, DETECTED_EXIT_DIR
+
+
+def extract_edge_slice(grid, direction):
+    """Returns a 3-element vector corresponding to an outer edge of a 3x3 face."""
+    if direction == "TOP":
+        return grid[0]
+    elif direction == "BOTTOM":
+        return grid[2]
+    elif direction == "LEFT":
+        return [grid[r][0] for r in range(3)]
+    elif direction == "RIGHT":
+        return [grid[r][2] for r in range(3)]
+    return ["Unknown", "Unknown", "Unknown"]
+
+
+def orient_grid_from_shared_edges(scanned_grid, prev_color, curr_color, exit_direction):
+    """
+    Computes spatial orientation by matching shared edge boundaries 
+    and motion trajectory vectors against BOY geometry.
+    """
+    global HUD_LAST_MOTION_MSG, HUD_LAST_ROTATION_STEPS
+
+    if prev_color not in BOY_NEIGHBORS.get(curr_color, []) or exit_direction == "NONE":
+        HUD_LAST_MOTION_MSG = f"STATIONARY ({curr_color})"
+        HUD_LAST_ROTATION_STEPS = 0
+        return scanned_grid
+
+    # 1. Base rotation from Boy Spatial Adjacency
+    neighbors = BOY_NEIGHBORS[curr_color]
+    expected_side_idx = neighbors.index(prev_color)
+    actual_side_map = {"TOP": 0, "RIGHT": 1, "BOTTOM": 2, "LEFT": 3}
+    actual_side_idx = actual_side_map[exit_direction]
+
+    base_rotation_steps = (expected_side_idx - actual_side_idx) % 4
+
+    # 2. Extract logged edge from previous face
+    prev_grid = CUBE_STATE.get(prev_color)
+    opposite_exit = {"TOP": "BOTTOM", "BOTTOM": "TOP", "LEFT": "RIGHT", "RIGHT": "LEFT"}[exit_direction]
+    logged_edge = extract_edge_slice(prev_grid, exit_direction)
+
+    # 3. Test rotations to find optimal boundary match
+    best_grid = scanned_grid
+    best_score = -1
+    best_steps = base_rotation_steps
+
+    test_grid = scanned_grid
+    for steps in range(4):
+        # The edge on the current face that touches the logged edge
+        candidate_edge = extract_edge_slice(test_grid, opposite_exit)
+
+        # Calculate matching score against known sticker values
+        score = sum(
+            1 for c1, c2 in zip(logged_edge, candidate_edge)
+            if c1 == c2 and c1 in VALID_COLORS
+        )
+
+        if score > best_score:
+            best_score = score
+            best_grid = test_grid
+            best_steps = steps
+
+        test_grid = rotate_matrix_90_cw(test_grid)
+
+    # Fall back to spatial direction if edge colors are unlogged/ambiguous
+    if best_score == 0:
+        oriented_grid = scanned_grid
+        for _ in range(base_rotation_steps):
+            oriented_grid = rotate_matrix_90_cw(oriented_grid)
+        best_grid = oriented_grid
+        best_steps = base_rotation_steps
+
+    HUD_LAST_MOTION_MSG = f"LOGGED {exit_direction}: {prev_color}->{curr_color} ({best_steps * 90}deg)"
+    HUD_LAST_ROTATION_STEPS = best_steps
+
+    return best_grid
+
+
+def resolve_cube_state_from_votes():
+    global CUBE_STATE
+    candidate_grid = {
+        col: [["Unknown"] * 3 for _ in range(3)] for col in CUBE_STATE
+    }
+
+    for center, grid_votes in CUBE_VOTES.items():
+        for r in range(3):
+            for c in range(3):
+                if r == 1 and c == 1:
+                    continue
+                valid_votes = [
+                    v for v in grid_votes[r][c] if v in VALID_COLORS
+                ]
+                if valid_votes:
+                    counts = {v: valid_votes.count(v) for v in set(valid_votes)}
+                    sorted_candidates = sorted(
+                        counts.keys(), key=lambda k: counts[k], reverse=True
+                    )
+                    candidate_grid[center][r][c] = sorted_candidates
+
+    new_state = {
+        col: [
+            ["Unknown", "Unknown", "Unknown"],
+            ["Unknown", col, "Unknown"],
+            ["Unknown", "Unknown", "Unknown"],
+        ]
+        for col in VALID_COLORS
+    }
+
+    for center in CUBE_STATE:
+        for r in range(3):
+            for c in range(3):
+                if r == 1 and c == 1:
+                    continue
+                candidates = candidate_grid[center][r][c]
+                if isinstance(candidates, list) and len(candidates) > 0:
+                    new_state[center][r][c] = candidates[0]
+
+    CUBE_STATE = new_state
+
+
+def auto_align_and_merge(scanned_grid):
+    global CUBE_STATE, CUBE_VOTES, CURRENT_CENTER
+
+    center_color = scanned_grid[1][1]
+    if center_color not in CUBE_STATE or center_color == "Unknown":
+        return
+
+    CURRENT_CENTER = center_color
+
+    for r in range(3):
+        for c in range(3):
+            if r == 1 and c == 1:
+                continue
+            new_val = scanned_grid[r][c]
+            if new_val in VALID_COLORS:
+                history = CUBE_VOTES[center_color][r][c]
+                history.append(new_val)
+                if len(history) > VOTE_WINDOW_SIZE:
+                    history.pop(0)
+
+    resolve_cube_state_from_votes()
+
+
+def sample_colors_inside_quad(photo_img, quad_pts, warp_size=240):
+    global LAST_STABLE_COLOR, CURRENT_CENTER, INITIAL_FACE_LOGGED, HUD_LAST_MOTION_MSG
+
+    dst_pts = np.float32(
+        [[0, 0], [warp_size, 0], [warp_size, warp_size], [0, warp_size]]
+    )
+    M = cv2.getPerspectiveTransform(quad_pts.astype(np.float32), dst_pts)
+    flat_face = cv2.warpPerspective(photo_img, M, (warp_size, warp_size))
+    hsv_face = cv2.cvtColor(flat_face, cv2.COLOR_BGR2HSV)
+
+    cell_size = warp_size // 3
+    margin = int(cell_size * 0.35)
+    current_frame_grid = [["Unknown" for _ in range(3)] for _ in range(3)]
+
+    for r in range(3):
+        for c in range(3):
+            x_start, y_start = c * cell_size, r * cell_size
+            hsv_patch = hsv_face[
+                y_start + margin : y_start + cell_size - margin,
+                x_start + margin : x_start + cell_size - margin,
+            ]
+            total_patch_pixels = hsv_patch.shape[0] * hsv_patch.shape[1]
+
+            color_pixel_counts = {}
+            for col_name, ranges in COLOR_RANGES_HSV.items():
+                mask = np.zeros(hsv_patch.shape[:2], dtype=np.uint8)
+                for lower, upper in ranges:
+                    mask = cv2.bitwise_or(
+                        mask, cv2.inRange(hsv_patch, np.array(lower), np.array(upper))
+                    )
+                color_pixel_counts[col_name] = cv2.countNonZero(mask)
+
+            candidate_color = max(color_pixel_counts, key=color_pixel_counts.get)
+            if (color_pixel_counts[candidate_color] / total_patch_pixels) < 0.20:
+                candidate_color = "Unknown"
+
+            current_frame_grid[r][c] = candidate_color
+
+    current_frame_grid = flip_matrix_horizontal(current_frame_grid)
+    detected_center = current_frame_grid[1][1]
+
+    if detected_center in VALID_COLORS:
+        if not INITIAL_FACE_LOGGED:
+            INITIAL_FACE_LOGGED = True
+            LAST_STABLE_COLOR = detected_center
+            CURRENT_CENTER = detected_center
+            HUD_LAST_MOTION_MSG = f"START FACE LOCKED: {detected_center}"
+            auto_align_and_merge(current_frame_grid)
+            return flat_face
+
+        if LAST_STABLE_COLOR is not None and detected_center != LAST_STABLE_COLOR:
+            current_frame_grid = orient_grid_from_shared_edges(
+                current_frame_grid,
+                LAST_STABLE_COLOR,
+                detected_center,
+                DETECTED_EXIT_DIR,
+            )
+            LAST_STABLE_COLOR = detected_center
+
+        CURRENT_CENTER = detected_center
+        auto_align_and_merge(current_frame_grid)
+
+    return flat_face
+
+
+def draw_master_net_preview(h, w_side=320):
+    net_img = np.zeros((h, w_side, 3), dtype=np.uint8)
+    net_img[:] = (35, 35, 35)
+
+    cv2.putText(
+        net_img,
+        "MASTER CUBE RECONSTRUCTION",
+        (15, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+    )
+
+    cell_s = 20
+    gap = 2
+    face_s = cell_s * 3 + gap * 2
+
+    offsets = {
+        "White": (w_side // 2 - face_s // 2, 40),
+        "Orange": (w_side // 2 - face_s // 2 - face_s - 10, 40 + face_s + 10),
+        "Green": (w_side // 2 - face_s // 2, 40 + face_s + 10),
+        "Red": (w_side // 2 - face_s // 2 + face_s + 10, 40 + face_s + 10),
+        "Blue": (w_side // 2 - face_s // 2 + (face_s + 10) * 2, 40 + face_s + 10),
+        "Yellow": (w_side // 2 - face_s // 2, 40 + (face_s + 10) * 2),
+    }
+
+    for face_color, (x0, y0) in offsets.items():
+        grid = CUBE_STATE[face_color]
+        for r in range(3):
+            for c in range(3):
+                col_name = grid[r][c]
+                bgr = DRAW_COLORS.get(col_name, (60, 60, 60))
+
+                x1 = x0 + c * (cell_s + gap)
+                y1 = y0 + r * (cell_s + gap)
+                x2 = x1 + cell_s
+                y2 = y1 + cell_s
+
+                cv2.rectangle(net_img, (x1, y1), (x2, y2), bgr, -1)
+                cv2.rectangle(net_img, (x1, y1), (x2, y2), (20, 20, 20), 1)
+
+        if CURRENT_CENTER == face_color:
+            cv2.rectangle(
+                net_img,
+                (x0 - 3, y0 - 3),
+                (x0 + face_s + 3, y0 + face_s + 3),
+                (0, 255, 255),
+                2,
+            )
+
+    return net_img
+
+
+def draw_debug_hud(frame, quad_corners, centroid):
+    h, w, _ = frame.shape
+
+    cv2.rectangle(frame, (0, 0), (w, 65), (25, 25, 25), -1)
+
+    if centroid is not None:
+        cx, cy = centroid
+        cv2.circle(frame, (cx, cy), 6, (0, 255, 255), -1)
+
+        dx, dy = OPTICAL_FLOW_VECTOR
+        end_x = int(cx + dx * 12)
+        end_y = int(cy + dy * 12)
+        cv2.arrowedLine(
+            frame, (cx, cy), (end_x, end_y), (0, 0, 255), 3, tipLength=0.3
+        )
+
+    init_status = "ACTIVE" if INITIAL_FACE_LOGGED else "SEARCHING..."
+    status_color = (0, 255, 0) if INITIAL_FACE_LOGGED else (0, 165, 255)
+
+    cv2.putText(
+        frame,
+        f"TRACKING: {init_status} | VECTOR: [{DETECTED_EXIT_DIR}]",
+        (15, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        status_color,
+        2,
+    )
+    cv2.putText(
+        frame,
+        f"STATE: {HUD_LAST_MOTION_MSG}",
+        (15, 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (255, 255, 255),
+        1,
+    )
+    cv2.putText(
+        frame,
+        f"ACTIVE: {CURRENT_CENTER}",
+        (w - 180, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2,
+    )
+    cv2.putText(
+        frame,
+        f"LAST: {LAST_STABLE_COLOR}",
+        (w - 180, 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (180, 180, 180),
+        1,
+    )
+
+
+# --- MAIN LOOP ---
+cv2.namedWindow("Main Feed")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    h_frame, w_frame, _ = frame.shape
+    display_frame = frame.copy()
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord("q"):
+        break
+
+    elif key == ord("r"):
+        INITIAL_FACE_LOGGED = False
+        LAST_STABLE_COLOR = None
+        CURRENT_CENTER = None
+        HUD_LAST_MOTION_MSG = "RESET: Searching for new start face..."
+        CUBE_STATE = {
+            col: [
+                ["Unknown", "Unknown", "Unknown"],
+                ["Unknown", col, "Unknown"],
+                ["Unknown", "Unknown", "Unknown"],
+            ]
+            for col in VALID_COLORS
+        }
+        CUBE_VOTES = {
+            col: [[[] for _ in range(3)] for _ in range(3)]
+            for col in VALID_COLORS
+        }
+
+    results = model(frame, conf=0.40, verbose=False)[0]
+
+    quad_corners = None
+    mask_binary = None
+    centroid = None
+
+    if results.masks is not None and len(results.masks) > 0:
+        masks = results.masks.data.cpu().numpy()
+        boxes = results.boxes.xyxy.cpu().numpy().astype(int)
+
+        best_idx = np.argmax([(b[2] - b[0]) * (b[3] - b[1]) for b in boxes])
+        best_mask = masks[best_idx]
+
+        mask_resized = cv2.resize(best_mask, (w_frame, h_frame))
+        mask_binary = (mask_resized > 0.5).astype(np.uint8) * 255
+
+        contours, _ = cv2.findContours(
+            mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if contours:
+            cnt = max(contours, key=cv2.contourArea)
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
+
+            if len(approx) == 4:
+                pts = approx.reshape(4, 2)
+            else:
+                rect = cv2.minAreaRect(cnt)
+                pts = cv2.boxPoints(rect)
+
+            quad_corners = order_quad_points(pts)
+            centroid = calculate_centroid(quad_corners)
+
+            cv2.polylines(
+                display_frame,
+                [quad_corners.astype(np.int32)],
+                True,
+                (0, 255, 0),
+                2,
+            )
+
+    calculate_fast_sparse_flow(frame, mask_binary)
+
+    if quad_corners is not None:
+        current_time = time.time()
+        if (current_time - last_auto_process_time) > AUTO_PROCESS_INTERVAL:
+            last_auto_process_time = current_time
+            sample_colors_inside_quad(frame, quad_corners)
+
+    draw_debug_hud(display_frame, quad_corners, centroid)
+
+    net_panel = draw_master_net_preview(h_frame, w_side=320)
+    combined_view = np.hstack((display_frame, net_panel))
+
+    cv2.imshow("Main Feed", combined_view)
+
+cap.release()
+cv2.destroyAllWindows()

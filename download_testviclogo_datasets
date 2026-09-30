@@ -1,0 +1,13 @@
+from roboflow import Roboflow
+
+# Initialize Roboflow with your API key
+rf = Roboflow(api_key="7EdWUUZ4KVSWAQSdLDzn")
+
+# Access the public Universe project
+project = rf.workspace("testviclogo").project("rubiks-cube-jkedc")
+version = project.version(1)
+
+# Download the complete dataset in YOLOv8 format
+dataset = version.download(model_format="yolov8", location="./rubiks_dataset")
+
+print("Dataset downloaded successfully to:", dataset.location)

@@ -1,0 +1,322 @@
+import cv2
+import glob
+import numpy as np
+from ultralytics import YOLO
+
+# --- HSV COLOR CALIBRATION ---
+COLOR_RANGES_HSV = {
+    'Red':    [((0, 140, 70), (8, 255, 255)), ((165, 140, 70), (180, 255, 255))],
+    'Orange': [((9, 120, 70), (22, 255, 255))],
+    'Yellow': [((23, 70, 150), (38, 255, 255))],
+    'Green':  [((39, 80, 70), (85, 255, 255))],
+    'Blue':   [((86, 80, 70), (125, 255, 255))],
+    'White':  [((0, 0, 160), (180, 50, 255))]
+}
+
+DRAW_COLORS = {
+    'White': (255, 255, 255), 'Yellow': (0, 255, 255), 'Red': (0, 0, 255),
+    'Orange': (0, 165, 255),  'Blue': (255, 0, 0),   'Green': (0, 255, 0),
+    'Unknown': (128, 128, 128)
+}
+
+smoothed_faces = {}
+captured_snapshots = {}
+
+
+def find_all_stickers(roi, offset_x, offset_y):
+    """Detects clean individual facelet contours & extracts local edge vectors."""
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                   cv2.THRESH_BINARY_INV, 11, 2)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    stickers = []
+    roi_area = roi.shape[0] * roi.shape[1]
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if (roi_area * 0.002) < area < (roi_area * 0.25):
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+
+            if 4 <= len(approx) <= 8:
+                rect = cv2.minAreaRect(cnt)
+                (cx_float, cy_float), (w, h), angle = rect
+                if w > 0 and h > 0:
+                    aspect_ratio = max(w, h) / min(w, h)
+                    if aspect_ratio < 2.0:  # Must be square-ish facelet
+                        cx = int(cx_float) + offset_x
+                        cy = int(cy_float) + offset_y
+                        cnt_full = cnt + np.array([[[offset_x, offset_y]]])
+
+                        stickers.append({
+                            'center': np.array([cx, cy], dtype=np.float32),
+                            'size': (w + h) / 2.0,  # Side length of 1 facelet
+                            'angle': angle,
+                            'contour': cnt_full
+                        })
+    return stickers
+
+
+def cluster_stickers_into_k_faces(stickers, k):
+    """Safely partitions stickers into k faces using K-Means."""
+    if k <= 0 or len(stickers) == 0:
+        return []
+
+    if len(stickers) < k:
+        return [[s] for s in stickers]
+
+    features = np.array([
+        [s['center'][0], s['center'][1], s['angle'] * 0.3] for s in stickers
+    ], dtype=np.float32)
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.2)
+
+    try:
+        _, labels, _ = cv2.kmeans(features, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+    except Exception:
+        return [stickers]
+
+    clusters = [[] for _ in range(k)]
+    flat_labels = labels.flatten()
+
+    for idx, sticker in enumerate(stickers):
+        if idx < len(flat_labels):
+            lbl = int(flat_labels[idx])
+            if 0 <= lbl < k:
+                clusters[lbl].append(sticker)
+
+    # Allow clusters with even 1 visible facelet!
+    valid_clusters = [c for c in clusters if len(c) >= 1]
+    valid_clusters.sort(key=lambda c: len(c), reverse=True)
+    return valid_clusters
+
+
+def order_quad_points(pts):
+    pts = pts.reshape((4, 2))
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+def reconstruct_quad_from_facelet_vectors(cluster_stickers, face_idx, alpha=0.35):
+    """
+    VECTOR EXTRAPOLATION:
+    Takes 1 or more facelets, extracts local edge vectors (u, v) and side length (s),
+    and scales them by 3.3x to project the entire face quad.
+    """
+    global smoothed_faces
+
+    pts = np.array([s['center'] for s in cluster_stickers], dtype=np.float32)
+    center = np.mean(pts, axis=0)  # Facelet centroid
+
+    # 1. Get median single facelet side length (s)
+    sizes = [s['size'] for s in cluster_stickers]
+    single_s = np.median(sizes) if len(sizes) > 0 else 30.0
+
+    # 2. Get median rotation angle from visible facelets
+    angles = [s['angle'] for s in cluster_stickers]
+    median_angle_deg = np.median(angles) if len(angles) > 0 else 0.0
+    angle_rad = np.radians(median_angle_deg)
+
+    # 3. Derive 2D orthogonal unit edge vectors
+    u_vec = np.array([np.cos(angle_rad), np.sin(angle_rad)], dtype=np.float32)
+    v_vec = np.array([-np.sin(angle_rad), np.cos(angle_rad)], dtype=np.float32)
+
+    # 4. Scale 1 facelet vector to full 3x3 face side (3.3 * single_s)
+    full_span = single_s * 3.3
+    half_span = full_span / 2.0
+
+    # 5. Project 4 quad corners using scaled edge vectors
+    corner_top_left     = center - (half_span * u_vec) - (half_span * v_vec)
+    corner_top_right    = center + (half_span * u_vec) - (half_span * v_vec)
+    corner_bottom_right = center + (half_span * u_vec) + (half_span * v_vec)
+    corner_bottom_left  = center - (half_span * u_vec) + (half_span * v_vec)
+
+    raw_corners = order_quad_points(np.array([
+        corner_top_left, corner_top_right, corner_bottom_right, corner_bottom_left
+    ], dtype=np.float32))
+
+    # Temporal smoothing
+    if face_idx in smoothed_faces:
+        prev = smoothed_faces[face_idx]
+        smoothed = (alpha * raw_corners) + ((1 - alpha) * prev)
+    else:
+        smoothed = raw_corners
+
+    smoothed_faces[face_idx] = smoothed
+    return smoothed
+
+
+def sample_colors_and_check_completion(frame, quad_pts, face_idx, warp_size=240):
+    dst_pts = np.float32([[0, 0], [warp_size, 0], [warp_size, warp_size], [0, warp_size]])
+    M = cv2.getPerspectiveTransform(quad_pts.astype(np.float32), dst_pts)
+    flat_face = cv2.warpPerspective(frame, M, (warp_size, warp_size))
+    hsv_face = cv2.cvtColor(flat_face, cv2.COLOR_BGR2HSV)
+
+    cell_size = warp_size // 3
+    margin = int(cell_size * 0.28)
+    valid_color_count = 0
+
+    for r in range(3):
+        for c in range(3):
+            x_start, y_start = c * cell_size, r * cell_size
+            patch = hsv_face[
+                y_start + margin : y_start + cell_size - margin,
+                x_start + margin : x_start + cell_size - margin
+            ]
+
+            max_px = 0
+            best_col = 'Unknown'
+            total_patch_px = patch.shape[0] * patch.shape[1]
+
+            for col_name, ranges in COLOR_RANGES_HSV.items():
+                mask = np.zeros(patch.shape[:2], dtype=np.uint8)
+                for (l, u) in ranges:
+                    mask = cv2.bitwise_or(mask, cv2.inRange(patch, np.array(l), np.array(u)))
+                cnt = cv2.countNonZero(mask)
+                if cnt > max_px:
+                    max_px = cnt
+                    best_col = col_name
+
+            if (max_px / total_patch_px) >= 0.20 and best_col != 'Unknown':
+                valid_color_count += 1
+            else:
+                best_col = 'Unknown'
+
+            draw_bgr = DRAW_COLORS.get(best_col, (128, 128, 128))
+            cv2.rectangle(flat_face, (x_start, y_start), 
+                          (x_start + cell_size, y_start + cell_size), (0, 255, 0), 1)
+            cv2.putText(flat_face, best_col[0], 
+                        (x_start + (cell_size // 2) - 10, y_start + (cell_size // 2) + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, draw_bgr, 2)
+
+    cv2.putText(flat_face, f"FACE {face_idx + 1}", (10, 25), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    is_complete = (valid_color_count == 9)
+    return flat_face, is_complete
+
+
+# --- MAIN CAMERA LOOP ---
+weights = glob.glob("runs/detect/*/weights/best.pt") + glob.glob("runs/pose/*/weights/best.pt")
+model = YOLO(weights[-1] if weights else "yolov8n.pt")
+
+cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
+
+is_paused = False
+last_annotated_frame = None
+last_combined_views = None
+
+print("\n--- SINGLE FACELET VECTOR EXTRAPOLATION SOLVER ---")
+print("Press SPACEBAR : Pause / Resume Live Feed")
+print("Press 'r'      : Reset Captured Freeze Frames")
+print("Press 'q'      : Quit Program\n")
+
+while True:
+    if not is_paused:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1)
+        h_frame, w_frame, _ = frame.shape
+        annotated_frame = frame.copy()
+
+        results = model(frame, conf=0.30, verbose=False)
+        boxes = results[0].boxes
+        warped_faces = []
+
+        if len(boxes) > 0:
+            box_areas = [(b.xyxy[0][2] - b.xyxy[0][0]) * (b.xyxy[0][3] - b.xyxy[0][1]) for b in boxes]
+            best_box = boxes[np.argmax(box_areas)].xyxy[0].cpu().numpy().astype(int)
+
+            pad = 15
+            x1 = max(0, best_box[0] - pad)
+            y1 = max(0, best_box[1] - pad)
+            x2 = min(w_frame, best_box[2] + pad)
+            y2 = min(h_frame, best_box[3] + pad)
+
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (255, 165, 0), 2)
+
+            roi = frame[y1:y2, x1:x2]
+            stickers = find_all_stickers(roi, offset_x=x1, offset_y=y1)
+
+            # Draw detected facelet centers (Yellow)
+            for s in stickers:
+                cx, cy = int(s['center'][0]), int(s['center'][1])
+                cv2.circle(annotated_frame, (cx, cy), 3, (0, 255, 255), -1)
+
+            n_stickers = len(stickers)
+            k_faces = 1 if n_stickers <= 9 else (2 if n_stickers <= 17 else 3) if n_stickers >= 1 else 0
+            face_clusters = cluster_stickers_into_k_faces(stickers, k=k_faces)
+            current_face_ids = set()
+
+            for i, cluster in enumerate(face_clusters):
+                current_face_ids.add(i)
+
+                # Reconstruct full 3x3 face quad from 1 single facelet edge vector!
+                quad_corners = reconstruct_quad_from_facelet_vectors(cluster, face_idx=i)
+                cv2.polylines(annotated_frame, [quad_corners.astype(np.int32)], True, (0, 255, 0), 2)
+
+                flat_face_img, is_complete = sample_colors_and_check_completion(frame, quad_corners, i)
+                warped_faces.append(flat_face_img)
+
+                # CAPTURE PHOTO / FREEZE FRAME when 9/9 colors visible
+                if is_complete:
+                    captured_snapshots[i] = flat_face_img.copy()
+
+            stale_keys = [k for k in smoothed_faces.keys() if k not in current_face_ids]
+            for k in stale_keys:
+                del smoothed_faces[k]
+        else:
+            smoothed_faces.clear()
+
+        last_combined_views = np.hstack(warped_faces) if len(warped_faces) > 0 else None
+        last_annotated_frame = annotated_frame
+
+    display_frame = last_annotated_frame.copy() if last_annotated_frame is not None else frame
+
+    # TOP-RIGHT FREEZE FRAME OVERLAY
+    if captured_snapshots:
+        thumb_w, thumb_h = 100, 100
+        margin = 10
+        for idx, (f_id, snap_img) in enumerate(sorted(captured_snapshots.items())):
+            resized_snap = cv2.resize(snap_img, (thumb_w, thumb_h))
+            x_offset = w_frame - (idx + 1) * (thumb_w + margin) - margin
+            y_offset = margin
+
+            if x_offset >= 0 and y_offset + thumb_h <= h_frame:
+                display_frame[y_offset:y_offset + thumb_h, x_offset:x_offset + thumb_w] = resized_snap
+                cv2.rectangle(display_frame, (x_offset, y_offset), 
+                              (x_offset + thumb_w, y_offset + thumb_h), (0, 255, 0), 2)
+                cv2.putText(display_frame, f"LOCKED F{f_id + 1}", 
+                            (x_offset + 5, y_offset + 18), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+
+    if is_paused:
+        cv2.putText(display_frame, "PAUSED (Press SPACEBAR)", (20, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
+
+    cv2.imshow("Single Facelet Vector Extrapolation", display_frame)
+    if last_combined_views is not None:
+        cv2.imshow("Warped Face Views (1-3)", last_combined_views)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord(' '):
+        is_paused = not is_paused
+    elif key == ord('r'):
+        captured_snapshots.clear()
+    elif key == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

@@ -1,0 +1,63 @@
+import cv2
+import os
+import time
+
+output_dir = "YOLO-pose dataset images"
+os.makedirs(output_dir, exist_ok=True)
+
+# Count existing images to avoid overwriting files
+existing_files = [f for f in os.listdir(output_dir) if f.endswith(".jpg")]
+count = len(existing_files)
+
+cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
+
+capturing = False
+interval = 0.8  # Seconds between auto-captures
+last_capture_time = 0
+
+print("Auto-Capture Initialized.")
+print("Press [SPACE] to start/pause auto-capture.")
+print("Press [Q] to quit.")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    display_frame = frame.copy()
+    current_time = time.time()
+
+    # Handle automatic capture logic
+    if capturing and (current_time - last_capture_time >= interval):
+        img_filename = os.path.join(output_dir, f"cube_pose_{count:04d}.jpg")
+        cv2.imwrite(img_filename, frame)
+        print(f"Auto-saved: {img_filename}")
+        count += 1
+        last_capture_time = current_time
+
+    # UI Overlay
+    status_text = "STATUS: RECORDING..." if capturing else "STATUS: PAUSED"
+    status_color = (0, 255, 0) if capturing else (0, 0, 255)
+
+    cv2.putText(display_frame, status_text, (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+    cv2.putText(display_frame, f"Captured: {count} images", (15, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(display_frame, "SPACE: Toggle Auto-Capture | Q: Quit", (15, 90),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+    cv2.imshow("Auto Dataset Collector", display_frame)
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord(" "):
+        capturing = not capturing
+        last_capture_time = time.time()  # Reset timer on toggle
+    elif key == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+print(f"Finished! Total images stored in '{output_dir}': {count}")

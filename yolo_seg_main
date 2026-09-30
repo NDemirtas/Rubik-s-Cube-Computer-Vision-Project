@@ -1,0 +1,45 @@
+import cv2
+import glob
+import os
+from ultralytics import YOLO
+
+# 1. Automatically find your best weights file
+weights_list = glob.glob("runs/segment/rubiks_seg_model*/weights/best.pt")
+if not weights_list:
+    raise FileNotFoundError("Could not find best.pt in runs/segment/")
+
+WEIGHTS_PATH = sorted(weights_list)[-1]
+print(f"Loading custom weights from: {WEIGHTS_PATH}")
+
+# 2. Load custom segmentation model
+model = YOLO(WEIGHTS_PATH)
+
+# --- CAMERA INITIALIZATION ---
+cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
+
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Failed to capture frame from camera.")
+        break
+
+    # Flip horizontally for natural mirror feel
+    frame = cv2.flip(frame, 1)
+
+    # Run inference with confidence threshold set to 40%
+    results = model(frame, device="mps", conf=0.4, verbose=False)[0]
+
+    # Overlay segmentation masks and boxes onto the frame
+    annotated_frame = results.plot()
+
+    cv2.imshow("Rubik's Cube Segmentation Test", annotated_frame)
+
+    # Press 'q' to exit
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

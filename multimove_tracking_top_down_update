@@ -1,0 +1,872 @@
+import glob
+import threading
+import time
+import cv2
+import numpy as np
+from flask import Flask, render_template_string
+from flask_socketio import SocketIO
+from ultralytics import YOLO
+
+from collections import deque
+import queue
+import traceback
+import kociemba
+
+# --- FLASK + SOCKET.IO SETUP ---
+app = Flask(__name__)
+app.config["SECRET_KEY"] = "rubiks_secret"
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+
+# ==============================================================================
+# 🎯 RE-MAPPED PERSPECTIVE CALIBRATION (THE ONLY CHANGES MADE)
+# ==============================================================================
+
+CAMERA_TO_USER_MOVE = {
+    # Camera F (Yellow) -> User U (Up)
+    "F": "U",   "F'": "U'",  "F2": "U2",
+    # Camera B (White) -> User D (Down)
+    "B": "D",   "B'": "D'",  "B2": "D2",
+    # Camera U (Green) -> User B (Back)
+    "U": "B",   "U'": "B'",  "U2": "B2",
+    # Camera D (Blue)  -> User F (Front)
+    "D": "F",   "D'": "F'",  "D2": "F2",
+    # Left & Right remain identical (Red & Orange)
+    "L": "L",   "L'": "L'",  "L2": "L2",
+    "R": "R",   "R'": "R'",  "R2": "R2",
+}
+
+def map_camera_move_to_user(move_str):
+    """Converts detected camera moves into the user's natural perspective."""
+    return CAMERA_TO_USER_MOVE.get(move_str, move_str)
+
+def remap_kociemba_for_user(raw_solution_str):
+    """Converts raw Kociemba solver output to User-calibrated sequence."""
+    if not raw_solution_str or raw_solution_str == "SOLVED":
+        return raw_solution_str
+    
+    moves = raw_solution_str.split()
+    user_moves = [map_camera_move_to_user(m) for m in moves]
+    return " ".join(user_moves)
+
+# ==============================================================================
+
+
+def flatten_move_sequence(deduced_sequence):
+    if not deduced_sequence or deduced_sequence == "UNKNOWN":
+        return []
+
+    raw_moves = []
+    if isinstance(deduced_sequence, str):
+        raw_moves = deduced_sequence.strip().split()
+    elif isinstance(deduced_sequence, list):
+        for item in deduced_sequence:
+            if isinstance(item, str):
+                raw_moves.extend(item.strip().split())
+            else:
+                raw_moves.append(str(item))
+
+    if not raw_moves:
+        return []
+
+    compressed_moves = []
+    for move in raw_moves:
+        if compressed_moves:
+            prev = compressed_moves[-1]
+            if move == prev and not move.endswith("2"):
+                base_face = move[0]
+                compressed_moves.pop()
+                compressed_moves.append(f"{base_face}2")
+                continue
+
+        compressed_moves.append(move)
+
+    return compressed_moves
+
+
+class PermutationCubeTracker:
+    F_INDICES = [9, 10, 11, 12, 13, 14, 15, 16, 17]
+
+    def __init__(self):
+        self.state = np.empty(54, dtype="<U10")
+        self.previous_state = np.empty(54, dtype="<U10")
+        self.permutations = {}
+        self._init_permutation_matrix()
+
+        self.last_move_detected = "None"
+        self.move_history = []
+        self.reset_to_solved()
+
+    def reset_to_solved(self):
+        self.state = np.array(
+            ["Green"] * 9
+            + ["Yellow"] * 9
+            + ["Blue"] * 9
+            + ["White"] * 9
+            + ["Orange"] * 9
+            + ["Red"] * 9,
+            dtype="<U10",
+        )
+        self.previous_state = self.state.copy()
+        self.last_move_detected = "None"
+        self.move_history = []
+        print("\n[PERMUTATION ENGINE] State reset to SOLVED.\n")
+        self.broadcast_state()
+
+    def _init_permutation_matrix(self):
+        I = np.arange(54)
+
+        def rot_cw(idx_list):
+            return [
+                idx_list[6], idx_list[3], idx_list[0],
+                idx_list[7], idx_list[4], idx_list[1],
+                idx_list[8], idx_list[5], idx_list[2],
+            ]
+
+        # --- R MOVE (Orange: 36-44) ---
+        pR = I.copy()
+        pR[36:45] = rot_cw(I[36:45])
+        pR[[9, 12, 15]]  = I[[0, 3, 6]]
+        pR[[18, 21, 24]] = I[[9, 12, 15]]
+        pR[[35, 32, 29]] = I[[18, 21, 24]]
+        pR[[0, 3, 6]]    = I[[35, 32, 29]]
+        self.permutations["R"]  = pR
+        self.permutations["R'"] = np.argsort(pR)
+
+        # --- L MOVE (Red: 45-53) ---
+        pL = I.copy()
+        pL[45:54] = rot_cw(I[45:54])
+        pL[[2, 5, 8]]    = I[[33, 30, 27]]
+        pL[[11, 14, 17]] = I[[2, 5, 8]]
+        pL[[20, 23, 26]] = I[[11, 14, 17]]
+        pL[[33, 30, 27]] = I[[20, 23, 26]]
+        self.permutations["L"]  = pL
+        self.permutations["L'"] = np.argsort(pL)
+
+        # --- U MOVE (Green: 0-8) ---
+        pU = I.copy()
+        pU[0:9] = rot_cw(I[0:9])
+        pU[[36, 37, 38]] = I[[9, 10, 11]]
+        pU[[27, 28, 29]] = I[[36, 37, 38]]
+        pU[[45, 46, 47]] = I[[27, 28, 29]]
+        pU[[9, 10, 11]]  = I[[45, 46, 47]]
+        self.permutations["U"]  = pU
+        self.permutations["U'"] = np.argsort(pU)
+
+        # --- D MOVE (Blue: 18-26) ---
+        pD = I.copy()
+        pD[18:27] = rot_cw(I[18:27])
+        pD[[51, 52, 53]] = I[[15, 16, 17]]
+        pD[[33, 34, 35]] = I[[51, 52, 53]]
+        pD[[42, 43, 44]] = I[[33, 34, 35]]
+        pD[[15, 16, 17]] = I[[42, 43, 44]]
+        self.permutations["D"]  = pD
+        self.permutations["D'"] = np.argsort(pD)
+
+        # --- F MOVE (Yellow: 9-17) ---
+        pF = I.copy()
+        pF[9:18] = rot_cw(I[9:18])
+        pF[[45, 48, 51]] = I[[6, 7, 8]]
+        pF[[20, 19, 18]] = I[[45, 48, 51]]
+        pF[[44, 41, 38]] = I[[20, 19, 18]]
+        pF[[6, 7, 8]]    = I[[44, 41, 38]]
+        self.permutations["F"]  = pF
+        self.permutations["F'"] = np.argsort(pF)
+
+        # --- B MOVE (White: 27-35) ---
+        pB = I.copy()
+        pB[27:36] = rot_cw(I[27:36])
+        pB[[36, 39, 42]] = I[[2, 1, 0]]
+        pB[[26, 25, 24]] = I[[36, 39, 42]]
+        pB[[53, 50, 47]] = I[[26, 25, 24]]
+        pB[[0, 1, 2]]    = I[[53, 50, 47]]
+        self.permutations["B"]  = pB
+        self.permutations["B'"] = np.argsort(pB)
+
+    def get_3x3_face_dict(self):
+        return {
+            "Green":  self.state[0:9].reshape((3, 3)).tolist(),
+            "Yellow": self.state[9:18].reshape((3, 3)).tolist(),
+            "Blue":   self.state[18:27].reshape((3, 3)).tolist(),
+            "White":  np.fliplr(self.state[27:36].reshape((3, 3))).tolist(),
+            "Orange": np.fliplr(self.state[36:45].reshape((3, 3))).tolist(),
+            "Red":    np.fliplr(self.state[45:54].reshape((3, 3))).tolist(),
+        }
+
+    def broadcast_state(self):
+        socketio.emit('cube_update', {
+            'active_center': str(self.state[13]),
+            'status': 'Active',
+            'move_history': self.move_history,
+            'last_move': getattr(self, 'last_move_detected', '-'),
+            'faces': self.get_3x3_face_dict()
+        })
+
+    def _flatten_state(self, state_array):
+        if isinstance(state_array, np.ndarray):
+            return state_array.flatten().tolist()
+        return list(state_array)
+
+    def state_to_kociemba_string(self, state_array=None):
+        if state_array is None:
+            state_array = self.state
+
+        flat_state = self._flatten_state(state_array)
+        if len(flat_state) != 54:
+            return None
+
+        try:
+            center_color_map = {
+                flat_state[4]: "U",   
+                flat_state[13]: "F",  
+                flat_state[22]: "D",  
+                flat_state[31]: "B",  
+                flat_state[40]: "R",  
+                flat_state[49]: "L",  
+            }
+
+            if len(set(center_color_map.keys())) < 6:
+                return None
+
+            u_face = flat_state[0:9]   
+            r_face = flat_state[36:45] 
+            f_face = flat_state[9:18]  
+            d_face = flat_state[18:27] 
+            l_face = flat_state[45:54] 
+            b_face = flat_state[27:36] 
+
+            kociemba_order = u_face + r_face + f_face + d_face + l_face + b_face
+            k_str = "".join([center_color_map[color] for color in kociemba_order])
+            
+            counts = {char: k_str.count(char) for char in "URFDLB"}
+            if any(count != 9 for count in counts.values()):
+                return None
+
+            return k_str
+        except (KeyError, IndexError):
+            return None
+
+    def trigger_kociemba_solve(self):
+        k_str = self.state_to_kociemba_string()
+        if not k_str:
+            print("\n❌ [KOCIEMBA]: Cannot solve. Invalid facelet state.\n")
+            return None
+
+        try:
+            raw_solution = kociemba.solve(k_str)
+            if not raw_solution or not raw_solution.strip():
+                print("\n🧩 CUBE IS ALREADY SOLVED!\n")
+                return "SOLVED"
+
+            user_solution = remap_kociemba_for_user(raw_solution)
+
+            print("\n" + "=" * 50)
+            print(f"🧩 RAW KOCIEMBA SOLUTION:    {raw_solution}")
+            print(f"👉 USER CALIBRATED SOLUTION: {user_solution}")
+            print("=" * 50 + "\n")
+
+            socketio.emit("kociemba_solution", {
+                "raw_solution": raw_solution,
+                "solution": user_solution
+            })
+            return user_solution
+        except Exception as e:
+            print(f"\n❌ [KOCIEMBA ERROR]: Unsolvable state configuration ({e})\n")
+            return None
+
+
+class SequenceBufferedTracker:
+    def __init__(self, cube_tracker):
+        self.tracker = cube_tracker
+        self.cube_tracker = cube_tracker
+        self.sequence_queue = queue.Queue(maxsize=10)
+
+        self.last_clean_grid = None
+        self.last_queued_grid = None
+        self.stable_frames = 0
+        self.MIN_HOLD = 2
+
+        self.pending_reconciliation = False
+        self.pre_glitch_state = None
+        self.unresolved_front_scans = []
+
+        self.consumer_thread = threading.Thread(
+            target=self._sequence_consumer, daemon=True
+        )
+        self.consumer_thread.start()
+
+    def _normalize(self, grid_data):
+        if grid_data is None:
+            return []
+        if isinstance(grid_data, list) and len(grid_data) > 0:
+            if isinstance(grid_data[0], list):
+                grid_data = [c for row in grid_data for c in row]
+        return [str(x) for x in list(grid_data)]
+
+    def process_camera_frame(self, scanned_grid):
+        if scanned_grid is None:
+            return
+
+        flat_grid = self._normalize(scanned_grid)
+
+        if flat_grid == self.last_clean_grid:
+            self.stable_frames += 1
+        else:
+            self.last_clean_grid = flat_grid
+            self.stable_frames = 0
+            return
+
+        if self.stable_frames >= self.MIN_HOLD:
+            if flat_grid != self.last_queued_grid:
+                self.last_queued_grid = flat_grid
+
+                if self.sequence_queue.full():
+                    try:
+                        self.sequence_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+
+                self.sequence_queue.put(flat_grid)
+
+    def _reconcile_multi_step_bridge(self, start_state, target_front, max_depth=4):
+        initial_front = self._normalize(start_state[9:18])
+        if target_front == initial_front:
+            return []
+
+        queue_bfs = deque([(start_state, [])])
+        visited_states = set([tuple(self._normalize(start_state))])
+
+        while queue_bfs:
+            curr_state, path = queue_bfs.popleft()
+
+            if len(path) >= max_depth:
+                continue
+
+            for move_name, perm in self.tracker.permutations.items():
+                next_state = curr_state[perm]
+                next_front = self._normalize(next_state[9:18])
+                
+                if next_front == target_front:
+                    return path + [move_name]
+
+                next_state_tuple = tuple(self._normalize(next_state))
+                if next_state_tuple not in visited_states:
+                    visited_states.add(next_state_tuple)
+                    queue_bfs.append((next_state, path + [move_name]))
+
+        return "UNKNOWN"
+
+    def _sequence_consumer(self):
+        while True:
+            try:
+                target_front = self.sequence_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            try:
+                if self.pending_reconciliation:
+                    current_known_front = self._normalize(self.pre_glitch_state[9:18])
+                    if target_front == current_known_front:
+                        self.pending_reconciliation = False
+                        self.unresolved_front_scans.clear()
+                        continue
+
+                    recovered_seq = self._reconcile_multi_step_bridge(
+                        self.pre_glitch_state, target_front, max_depth=4
+                    )
+
+                    if recovered_seq != "UNKNOWN" and len(recovered_seq) > 0:
+                        curr = self.pre_glitch_state.copy()
+                        for move in recovered_seq:
+                            if move in self.tracker.permutations:
+                                curr = curr[self.tracker.permutations[move]]
+                                user_move = map_camera_move_to_user(move)
+                                self.tracker.move_history.append(user_move)
+                                self.tracker.last_move_detected = user_move
+                        
+                        self.tracker.state = curr
+                        self.tracker.previous_state = curr.copy()
+                        self.pending_reconciliation = False
+                        self.unresolved_front_scans.clear()
+                        self.tracker.broadcast_state()
+                        continue
+                    else:
+                        self.unresolved_front_scans.append(target_front)
+                        if len(self.unresolved_front_scans) > 3:
+                            self.pending_reconciliation = False
+                            self.unresolved_front_scans.clear()
+                        continue
+
+                resolved_sequence = self._deduce_probable_move_sequence(
+                    target_front, max_depth=3
+                )
+
+                if resolved_sequence == "UNKNOWN":
+                    self.pending_reconciliation = True
+                    self.pre_glitch_state = self.tracker.state.copy()
+                    self.unresolved_front_scans.append(target_front)
+                    self.tracker.last_move_detected = "Analyzing..."
+                    self.tracker.broadcast_state()
+
+                elif isinstance(resolved_sequence, list) and len(resolved_sequence) > 0:
+                    raw_atomic = flatten_move_sequence(resolved_sequence)
+
+                    for m in raw_atomic:
+                        if m in self.tracker.permutations:
+                            perm = self.tracker.permutations[m]
+                            self.tracker.state = self.tracker.state[perm]
+
+                        user_m = map_camera_move_to_user(m)
+
+                        if (
+                            self.tracker.move_history
+                            and self.tracker.move_history[-1] == user_m
+                            and not user_m.endswith("2")
+                        ):
+                            base_face = user_m[0]
+                            double_move = f"{base_face}2"
+
+                            self.tracker.move_history.pop()
+                            self.tracker.move_history.append(double_move)
+                            self.tracker.last_move_detected = double_move
+                        else:
+                            self.tracker.move_history.append(user_m)
+                            self.tracker.last_move_detected = user_m
+
+                    self.tracker.previous_state = self.tracker.state.copy()
+                    self.tracker.broadcast_state()
+
+            except Exception as e:
+                print(f"❌ [Consumer Exception]: {e}")
+                traceback.print_exc()
+
+            finally:
+                self.sequence_queue.task_done()
+
+    def _deduce_probable_move_sequence(self, target_front, max_depth=3):
+        if "Unknown" in target_front:
+            return "UNKNOWN"
+
+        initial_state = self.tracker.state.copy()
+        initial_front = self._normalize(initial_state[9:18])
+
+        if target_front == initial_front and len(target_front) == 9:
+            return []
+
+        MOVE_COSTS = {
+            "R": 1.0, "R'": 1.0, "L": 1.0, "L'": 1.0, "U": 1.0, "U'": 1.0,
+            "D": 1.0, "D'": 1.0, "F": 1.0, "F'": 1.0, "B": 1.1, "B'": 1.1,
+            "S": 1.5, "S'": 1.5, "Z": 2.0, "Z'": 2.0
+        }
+
+        queue_bfs = deque([(0.0, 0, initial_state, [])])
+        candidates = []
+        visited_states = set()
+
+        while queue_bfs:
+            cost, depth, curr_state, path = queue_bfs.popleft()
+
+            if depth >= max_depth:
+                continue
+
+            for move_name, perm in self.tracker.permutations.items():
+                next_state = curr_state[perm]
+                next_front = self._normalize(next_state[9:18])
+                next_state_tuple = tuple(self._normalize(next_state))
+
+                move_cost = MOVE_COSTS.get(move_name, 1.2)
+                total_cost = cost + move_cost
+                new_path = path + [move_name]
+
+                if next_front == target_front:
+                    candidates.append((total_cost, new_path))
+
+                if next_state_tuple not in visited_states and depth + 1 < max_depth:
+                    visited_states.add(next_state_tuple)
+                    queue_bfs.append((total_cost, depth + 1, next_state, new_path))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            best_sequence = candidates[0][1]
+            return best_sequence
+
+        return "UNKNOWN"
+
+
+# --- CAMERA & DETECTION SETUP ---
+cap = cv2.VideoCapture(1)
+
+weights_list = glob.glob("runs/segment/rubiks_seg_model/weights/best.pt")
+MODEL_PATH = weights_list[0] if weights_list else "yolov8n-seg.pt"
+model = YOLO(MODEL_PATH)
+
+COLOR_RANGES_HSV = {
+    "Red": [
+        ((0, 120, 70), (7, 255, 255)),
+        ((165, 120, 70), (180, 255, 255)),
+    ],
+    "Orange": [((8, 120, 70), (20, 255, 255))],
+    "Yellow": [((21, 70, 110), (36, 255, 255))],
+    "Green": [((37, 70, 70), (85, 255, 255))],
+    "Blue": [((86, 70, 70), (130, 255, 255))],
+    "White": [((0, 0, 120), (180, 50, 255))],
+}
+
+COLOR_BGR_MAP = {
+    "Red": (0, 0, 255),
+    "Orange": (0, 165, 255),
+    "Yellow": (0, 255, 255),
+    "Green": (0, 255, 0),
+    "Blue": (255, 0, 0),
+    "White": (255, 255, 255),
+    "Unknown": (50, 50, 50),
+}
+
+
+def get_color_from_patch(hsv_patch):
+    total_pixels = hsv_patch.shape[0] * hsv_patch.shape[1]
+    if total_pixels == 0:
+        return "Unknown"
+
+    best_color = "Unknown"
+    max_match_pct = 0.0
+
+    for col_name, ranges in COLOR_RANGES_HSV.items():
+        mask = np.zeros(hsv_patch.shape[:2], dtype=np.uint8)
+        for lower, upper in ranges:
+            mask = cv2.bitwise_or(
+                mask, cv2.inRange(hsv_patch, np.array(lower), np.array(upper))
+            )
+
+        match_pct = cv2.countNonZero(mask) / total_pixels
+        if match_pct > max_match_pct and match_pct > 0.15:
+            max_match_pct = match_pct
+            best_color = col_name
+
+    return best_color
+
+
+def extract_facelet_grid_with_debug(frame, quad_pts, warp_size=240):
+    dst_pts = np.float32(
+        [[0, 0], [warp_size, 0], [warp_size, warp_size], [0, warp_size]]
+    )
+    M = cv2.getPerspectiveTransform(quad_pts.astype(np.float32), dst_pts)
+    flat_face = cv2.warpPerspective(frame, M, (warp_size, warp_size))
+    hsv_face = cv2.cvtColor(flat_face, cv2.COLOR_BGR2HSV)
+
+    cell_size = warp_size // 3
+    margin = int(cell_size * 0.35)
+
+    grid = [["Unknown"] * 3 for _ in range(3)]
+
+    for r in range(3):
+        for c in range(3):
+            x_start, y_start = c * cell_size, r * cell_size
+            hsv_patch = hsv_face[
+                y_start + margin : y_start + cell_size - margin,
+                x_start + margin : x_start + cell_size - margin,
+            ]
+            grid[r][c] = get_color_from_patch(hsv_patch)
+
+    return grid, flat_face
+
+
+def draw_permutation_ui(frame, current_grid, flat_face, cube_tracker):
+    h, w, _ = frame.shape
+    start_x, start_y = 20, 120
+    box_s = 18
+
+    cv2.putText(
+        frame,
+        "PREDICTIVE ENGINE INSPECTOR (54 Facelets)",
+        (start_x, start_y - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 255),
+        2,
+    )
+
+    face_offsets = {
+        "Green (U)": (start_x + 4 * box_s, start_y, 0),
+        "Red (L)": (start_x, start_y + 3 * box_s, 45),
+        "Yellow (F)": (start_x + 4 * box_s, start_y + 3 * box_s, 9),
+        "Orange (R)": (start_x + 8 * box_s, start_y + 3 * box_s, 36),
+        "White (B)": (start_x + 12 * box_s, start_y + 3 * box_s, 27),
+        "Blue (D)": (start_x + 4 * box_s, start_y + 6 * box_s, 18),
+    }
+
+    for name, (fx, fy, base_idx) in face_offsets.items():
+        for r in range(3):
+            for c in range(3):
+                idx = base_idx + r * 3 + c
+                color_str = cube_tracker.state[idx]
+                bgr = COLOR_BGR_MAP.get(color_str, (50, 50, 50))
+
+                x1 = fx + c * box_s
+                y1 = fy + r * box_s
+                cv2.rectangle(
+                    frame, (x1, y1), (x1 + box_s - 2, y1 + box_s - 2), bgr, -1
+                )
+                cv2.rectangle(
+                    frame,
+                    (x1, y1),
+                    (x1 + box_s - 2, y1 + box_s - 2),
+                    (0, 0, 0),
+                    1,
+                )
+
+    log_x, log_y = 20, start_y + 10 * box_s + 10
+    panel_w, panel_h = 290, 130
+    cv2.rectangle(
+        frame,
+        (log_x, log_y),
+        (log_x + panel_w, log_y + panel_h),
+        (20, 20, 20),
+        -1,
+    )
+    cv2.rectangle(
+        frame,
+        (log_x, log_y),
+        (log_x + panel_w, log_y + panel_h),
+        (0, 255, 255),
+        1,
+    )
+    cv2.putText(
+        frame,
+        f"USER MOVES ({len(cube_tracker.move_history)})",
+        (log_x + 10, log_y + 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 255),
+        2,
+    )
+
+    recent_moves = cube_tracker.move_history[-5:]
+    if recent_moves:
+        history_str = " -> ".join(recent_moves)
+        if len(history_str) > 30:
+            history_str = "..." + history_str[-27:]
+        cv2.putText(
+            frame,
+            history_str,
+            (log_x + 10, log_y + 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 0),
+            2,
+        )
+
+
+# --- WEB VISUALIZATION ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>3D Rubik's Cube Viewer</title>
+    <style>
+        body { margin: 0; background: #111; color: #fff; font-family: sans-serif; overflow: hidden; }
+        #hud { 
+            position: absolute; 
+            top: 10px; 
+            left: 10px; 
+            background: rgba(0,0,0,0.85); 
+            padding: 15px; 
+            border-radius: 8px; 
+            z-index: 10; 
+            width: 260px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+        }
+        #hud h2 { margin-top: 0; font-size: 1.2rem; color: #00ff00; }
+        #hud p { margin: 6px 0; font-size: 0.9rem; }
+        .history-box { 
+            margin-top: 12px; 
+            background: #1a1a1a; 
+            border: 1px solid #333; 
+            padding: 10px; 
+            border-radius: 6px; 
+            max-height: 180px; 
+            overflow-y: auto; 
+        }
+        .history-title { font-weight: bold; font-size: 0.85rem; color: #00ffff; margin-bottom: 6px; }
+        .move-tag { 
+            display: inline-block; 
+            background: #222; 
+            border: 1px solid #444; 
+            color: #fff; 
+            padding: 3px 6px; 
+            margin: 2px; 
+            border-radius: 4px; 
+            font-family: monospace; 
+            font-size: 0.85rem;
+        }
+        .move-tag.latest { background: #008800; border-color: #00ff00; font-weight: bold; }
+        #canvas { width: 100vw; height: 100vh; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+    <div id="hud">
+        <h2>Predictive State Engine</h2>
+        <p>Active Center: <b id="active">-</b></p>
+        <p>Status: <span id="status">Connecting...</span></p>
+
+        <div class="history-box">
+            <div class="history-title">USER MOVES (<span id="move-count">0</span>)</div>
+            <div id="history-list"><i>No moves recorded</i></div>
+        </div>
+    </div>
+    <div id="canvas"></div>
+    <script>
+        const socket = io();
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x111111);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(5, 4, 6); 
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.getElementById('canvas').appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        const COLOR_MAP = {
+            'White': 0xffffff, 'Yellow': 0xffff00,
+            'Green': 0x00ff00, 'Blue': 0x0000ff,
+            'Orange': 0xffa500, 'Red': 0xff0000,
+            'Unknown': 0x222222
+        };
+
+        let cubies = [];
+
+        function createCube() {
+            const size = 0.95;
+            const geometry = new THREE.BoxGeometry(size, size, size);
+
+            for (let x = -1; x <= 1; x++) {
+                for (let y = -1; y <= 1; y++) {
+                    for (let z = -1; z <= 1; z++) {
+                        if (x === 0 && y === 0 && z === 0) continue;
+
+                        const materials = Array(6).fill().map(() => new THREE.MeshBasicMaterial({ color: 0x111111 }));
+                        const mesh = new THREE.Mesh(geometry, materials);
+                        mesh.position.set(x, y, z);
+                        scene.add(mesh);
+                        cubies.push({ mesh, x, y, z });
+                    }
+                }
+            }
+        }
+        createCube();
+
+        function update3DCube(faces) {
+            cubies.forEach(cubie => {
+                const { mesh, x, y, z } = cubie;
+                const mats = mesh.material;
+
+                const col = x + 1;
+                const rowY = 1 - y;
+                const depthZ = 1 - z;
+
+                if (x === 1) mats[0].color.setHex(COLOR_MAP[faces.Orange[rowY][depthZ]] || 0x222222);
+                if (x === -1) mats[1].color.setHex(COLOR_MAP[faces.Red[rowY][z + 1]] || 0x222222);
+                if (y === 1) mats[2].color.setHex(COLOR_MAP[faces.Green[depthZ][col]] || 0x222222);
+                if (y === -1) mats[3].color.setHex(COLOR_MAP[faces.Blue[1 - depthZ][col]] || 0x222222);
+                if (z === 1) mats[4].color.setHex(COLOR_MAP[faces.Yellow[rowY][col]] || 0x222222);
+                if (z === -1) mats[5].color.setHex(COLOR_MAP[faces.White[rowY][2 - col]] || 0x222222);
+            });
+        }
+
+        function updateHistory(history) {
+            const container = document.getElementById('history-list');
+            document.getElementById('move-count').innerText = history ? history.length : 0;
+            
+            if (!history || history.length === 0) {
+                container.innerHTML = '<i>No moves recorded</i>';
+                return;
+            }
+            
+            container.innerHTML = history.map((m, idx) => {
+                const isLatest = idx === history.length - 1;
+                return `<span class="move-tag ${isLatest ? 'latest' : ''}">${idx + 1}. ${m}</span>`;
+            }).join(' ');
+        }
+
+        socket.on('cube_update', (data) => {
+            document.getElementById('active').innerText = data.active_center;
+            document.getElementById('status').innerText = data.status;
+            update3DCube(data.faces);
+            updateHistory(data.move_history);
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+
+cube_tracker = PermutationCubeTracker()
+sequence_tracker = SequenceBufferedTracker(cube_tracker)
+
+
+def run_flask():
+    socketio.run(app, host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+
+
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
+
+
+# --- MAIN CV LOOP ---
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    results = model(frame, stream=True, verbose=False)
+
+    for r in results:
+        if r.masks is not None:
+            for mask in r.masks.xy:
+                if len(mask) >= 4:
+                    rect = cv2.minAreaRect(mask.astype(np.float32))
+                    box = cv2.boxPoints(rect)
+                    box = np.int32(box)
+
+                    cv2.polylines(frame, [box], True, (0, 255, 0), 2)
+
+                    grid, flat_face = extract_facelet_grid_with_debug(frame, box)
+                    sequence_tracker.process_camera_frame(grid)
+                    draw_permutation_ui(frame, grid, flat_face, cube_tracker)
+
+    cv2.imshow("Rubik's Cube Top-Down Tracker", frame)
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord('r'):
+        cube_tracker.reset_to_solved()
+    elif key == ord('s'):
+        cube_tracker.trigger_kociemba_solve()
+
+cap.release()
+cv2.destroyAllWindows()

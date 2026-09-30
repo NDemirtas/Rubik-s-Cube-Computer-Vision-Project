@@ -1,0 +1,13 @@
+from ultralytics import YOLO
+
+# Load base YOLOv8 pose model
+model = YOLO("yolov8n-pose.pt")
+
+# Train directly on the downloaded dataset
+results = model.train(
+    data="./Rubik's-Cube-TestVicLogo-YOLO-Keypoint-Dataset/data.yaml",
+    epochs=100,
+    imgsz=640,
+    batch=16,
+    name="rubiks_pose_model"
+)

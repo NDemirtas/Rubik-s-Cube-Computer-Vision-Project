@@ -1,0 +1,67 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+model = YOLO("runs/pose/train-3/weights/best.pt")
+
+cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
+
+FACE_COLORS = {
+    "top": (255, 191, 0),    # Cyan/Blue
+    "left": (0, 255, 0),     # Green
+    "right": (0, 0, 255)     # Red
+}
+ALPHA = 0.45
+SMOOTHING = 0.6  # Higher = smoother tracking, slightly more lag (0.1 to 0.9)
+
+prev_kpts = None
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+
+    frame = cv2.flip(frame, 1)
+    overlay = frame.copy()
+
+    # Lower confidence threshold slightly if points drop out frequently
+    results = model(frame, conf=0.35, verbose=False)
+
+    if results[0].keypoints is not None and len(results[0].keypoints) > 0:
+        raw_kpts = results[0].keypoints.xy[0].cpu().numpy()
+
+        if len(raw_kpts) == 7 and not np.any(raw_kpts == 0):
+            # Apply EMA smoothing over time
+            if prev_kpts is None:
+                smooth_kpts = raw_kpts
+            else:
+                smooth_kpts = (SMOOTHING * prev_kpts) + ((1 - SMOOTHING) * raw_kpts)
+            
+            prev_kpts = smooth_kpts
+            pts = smooth_kpts.astype(int)
+
+            # Assign explicit nodes
+            k0, k1, k2, k3, k4, k5, k6 = pts[0], pts[1], pts[2], pts[3], pts[4], pts[5], pts[6]
+
+            # Adjust polygon ordering based on your dataset annotation direction
+            top_face = np.array([k0, k1, k2, k3], dtype=np.int32)
+            right_face = np.array([k0, k3, k4, k5], dtype=np.int32)
+            left_face = np.array([k0, k5, k6, k1], dtype=np.int32)
+
+            # Draw filled regions
+            cv2.fillPoly(overlay, [top_face], FACE_COLORS["top"])
+            cv2.fillPoly(overlay, [left_face], FACE_COLORS["left"])
+            cv2.fillPoly(overlay, [right_face], FACE_COLORS["right"])
+
+            # Draw crisp borders
+            for face in [top_face, left_face, right_face]:
+                cv2.polylines(frame, [face], isClosed=True, color=(255, 255, 255), thickness=2)
+
+    cv2.addWeighted(overlay, ALPHA, frame, 1 - ALPHA, 0, frame)
+    cv2.imshow("Smooth Face Tracker", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+cap.release()
+cv2.destroyAllWindows()

@@ -1,0 +1,759 @@
+import glob
+import threading
+import time
+import cv2
+from flask import Flask, render_template_string
+from flask_socketio import SocketIO
+import numpy as np
+from ultralytics import YOLO
+
+# --- FLASK + SOCKET.IO SETUP ---
+app = Flask(__name__)
+app.config["SECRET_KEY"] = "rubiks_secret"
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+# --- CAMERA INITIALIZATION ---
+cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
+
+weights_list = glob.glob("runs/segment/rubiks_seg_model/weights/best.pt")
+MODEL_PATH = weights_list[0] if weights_list else "yolov8n-seg.pt"
+model = YOLO(MODEL_PATH)
+
+COLOR_RANGES_HSV = {
+    "Red": [
+        ((0, 150, 60), (6, 255, 255)),
+        ((168, 150, 60), (180, 255, 255)),
+    ],
+    "Orange": [((7, 140, 60), (22, 255, 255))],
+    "Yellow": [((23, 80, 100), (38, 255, 255))],
+    "Green": [((39, 80, 60), (85, 255, 255))],
+    "Blue": [((86, 80, 60), (125, 255, 255))],
+    "White": [((0, 0, 150), (180, 60, 255))],
+}
+
+
+class RubiksCubeTracker:
+
+    def __init__(self):
+        self.state = {}
+        self.reset_to_solved()
+        self.active_camera_face = "Green"
+        self.last_move_detected = "None"
+        self.move_history = []
+
+    def reset_to_solved(self):
+        self.state = {
+            "White": [["White"] * 3 for _ in range(3)],
+            "Yellow": [["Yellow"] * 3 for _ in range(3)],
+            "Green": [["Green"] * 3 for _ in range(3)],
+            "Blue": [["Blue"] * 3 for _ in range(3)],
+            "Orange": [["Orange"] * 3 for _ in range(3)],
+            "Red": [["Red"] * 3 for _ in range(3)],
+        }
+        self.active_camera_face = "Green"
+        self.last_move_detected = "None"
+        self.move_history = []
+        print("\n[CUBE STATE] Reset to SOLVED.\n")
+        self.broadcast_state()
+
+    def broadcast_state(self):
+        socketio.emit(
+            "cube_update",
+            {
+                "faces": self.state,
+                "active_center": self.active_camera_face,
+                "status": self.last_move_detected,
+            },
+        )
+
+    # --- MATRIX HELPERS ---
+    @staticmethod
+    def rotate_matrix_cw(matrix):
+        return [list(row) for row in zip(*matrix[::-1])]
+
+    @staticmethod
+    def rotate_matrix_ccw(matrix):
+        return [list(row) for row in zip(*matrix)][::-1]
+
+    # --- FULL-CUBE ROTATION HANDLERS ---
+    def apply_x_move(self, is_prime=False):
+        """Rotate whole cube around X-axis."""
+        orig_f = [row[:] for row in self.state["Green"]]
+        orig_u = [row[:] for row in self.state["White"]]
+        orig_b = [row[:] for row in self.state["Blue"]]
+        orig_d = [row[:] for row in self.state["Yellow"]]
+
+        if not is_prime:
+            self.state["Green"] = orig_d
+            self.state["White"] = orig_f
+            self.state["Blue"] = [orig_u[2 - r][::-1] for r in range(3)]
+            self.state["Yellow"] = [orig_b[2 - r][::-1] for r in range(3)]
+
+            self.state["Red"] = self.rotate_matrix_cw(self.state["Red"])
+            self.state["Orange"] = self.rotate_matrix_ccw(self.state["Orange"])
+            self.active_camera_face = "Yellow"
+        else:
+            self.state["Green"] = orig_u
+            self.state["Yellow"] = orig_f
+            self.state["Blue"] = [orig_d[2 - r][::-1] for r in range(3)]
+            self.state["White"] = [orig_b[2 - r][::-1] for r in range(3)]
+
+            self.state["Red"] = self.rotate_matrix_ccw(self.state["Red"])
+            self.state["Orange"] = self.rotate_matrix_cw(self.state["Orange"])
+            self.active_camera_face = "White"
+
+    def apply_y_move(self, is_prime=False):
+        """Rotate whole cube around Y-axis (Green moves Right -> Orange takes Front)."""
+        orig_f = [row[:] for row in self.state["Green"]]
+        orig_r = [row[:] for row in self.state["Red"]]
+        orig_b = [row[:] for row in self.state["Blue"]]
+        orig_l = [row[:] for row in self.state["Orange"]]
+
+        if not is_prime:
+            self.state["Green"] = orig_l
+            self.state["Red"] = orig_f
+            self.state["Blue"] = orig_r
+            self.state["Orange"] = orig_b
+
+            self.state["White"] = self.rotate_matrix_ccw(self.state["White"])
+            self.state["Yellow"] = self.rotate_matrix_cw(self.state["Yellow"])
+            self.active_camera_face = "Orange"
+        else:
+            self.state["Green"] = orig_r
+            self.state["Orange"] = orig_f
+            self.state["Blue"] = orig_l
+            self.state["Red"] = orig_b
+
+            self.state["White"] = self.rotate_matrix_cw(self.state["White"])
+            self.state["Yellow"] = self.rotate_matrix_ccw(self.state["Yellow"])
+            self.active_camera_face = "Red"
+
+    def apply_z_move(self, is_prime=False):
+        """Rotate whole cube around Z-axis."""
+        orig_u = [row[:] for row in self.state["White"]]
+        orig_r = [row[:] for row in self.state["Red"]]
+        orig_d = [row[:] for row in self.state["Yellow"]]
+        orig_l = [row[:] for row in self.state["Orange"]]
+
+        if not is_prime:
+            self.state["White"] = self.rotate_matrix_cw(self.state["White"])
+            self.state["Yellow"] = self.rotate_matrix_cw(self.state["Yellow"])
+            self.state["Green"] = self.rotate_matrix_cw(self.state["Green"])
+            self.state["Blue"] = self.rotate_matrix_ccw(self.state["Blue"])
+
+            self.state["Red"] = [
+                [orig_u[2 - c][r] for c in range(3)] for r in range(3)
+            ]
+            self.state["Yellow"] = [
+                [orig_r[2 - c][r] for c in range(3)] for r in range(3)
+            ]
+            self.state["Orange"] = [
+                [orig_d[2 - c][r] for c in range(3)] for r in range(3)
+            ]
+            self.state["White"] = [
+                [orig_l[2 - c][r] for c in range(3)] for r in range(3)
+            ]
+        else:
+            self.state["White"] = self.rotate_matrix_ccw(self.state["White"])
+            self.state["Yellow"] = self.rotate_matrix_ccw(self.state["Yellow"])
+            self.state["Green"] = self.rotate_matrix_ccw(self.state["Green"])
+            self.state["Blue"] = self.rotate_matrix_cw(self.state["Blue"])
+
+            self.state["Orange"] = [
+                [orig_u[c][2 - r] for c in range(3)] for r in range(3)
+            ]
+            self.state["Yellow"] = [
+                [orig_l[c][2 - r] for c in range(3)] for r in range(3)
+            ]
+            self.state["Red"] = [
+                [orig_d[c][2 - r] for c in range(3)] for r in range(3)
+            ]
+            self.state["White"] = [
+                [orig_r[c][2 - r] for c in range(3)] for r in range(3)
+            ]
+
+    # --- OUTER FACE MOVES ---
+    def apply_l_move(self, is_prime=False):
+        orig_u_col0 = [self.state["White"][r][0] for r in range(3)]
+        orig_f_col0 = [self.state["Green"][r][0] for r in range(3)]
+        orig_d_col0 = [self.state["Yellow"][r][0] for r in range(3)]
+        orig_b_col2 = [self.state["Blue"][r][2] for r in range(3)]
+
+        if not is_prime:
+            for r in range(3):
+                self.state["Green"][r][0] = orig_d_col0[r]
+                self.state["Yellow"][r][0] = orig_b_col2[2 - r]
+                self.state["Blue"][r][2] = orig_u_col0[2 - r]
+                self.state["White"][r][0] = orig_f_col0[r]
+        else:
+            for r in range(3):
+                self.state["Green"][r][0] = orig_u_col0[r]
+                self.state["White"][r][0] = orig_b_col2[2 - r]
+                self.state["Blue"][r][2] = orig_d_col0[2 - r]
+                self.state["Yellow"][r][0] = orig_f_col0[r]
+
+    def apply_r_move(self, is_prime=False):
+        orig_u_col2 = [self.state["White"][r][2] for r in range(3)]
+        orig_f_col2 = [self.state["Green"][r][2] for r in range(3)]
+        orig_d_col2 = [self.state["Yellow"][r][2] for r in range(3)]
+        orig_b_col0 = [self.state["Blue"][r][0] for r in range(3)]
+
+        if not is_prime:
+            for r in range(3):
+                self.state["Green"][r][2] = orig_u_col2[r]
+                self.state["White"][r][2] = orig_b_col0[2 - r]
+                self.state["Blue"][r][0] = orig_d_col2[2 - r]
+                self.state["Yellow"][r][2] = orig_f_col2[r]
+        else:
+            for r in range(3):
+                self.state["Green"][r][2] = orig_d_col2[r]
+                self.state["Yellow"][r][2] = orig_b_col0[2 - r]
+                self.state["Blue"][r][0] = orig_u_col2[2 - r]
+                self.state["White"][r][2] = orig_f_col2[r]
+
+    def apply_u_move(self, is_prime=False):
+        orig_f_row0 = list(self.state["Green"][0])
+        orig_r_row0 = list(self.state["Red"][0])
+        orig_b_row0 = list(self.state["Blue"][0])
+        orig_l_row0 = list(self.state["Orange"][0])
+
+        if not is_prime:
+            self.state["Green"][0] = orig_r_row0
+            self.state["Orange"][0] = orig_f_row0
+            self.state["Blue"][0] = orig_l_row0
+            self.state["Red"][0] = orig_b_row0
+        else:
+            self.state["Green"][0] = orig_l_row0
+            self.state["Red"][0] = orig_f_row0
+            self.state["Blue"][0] = orig_r_row0
+            self.state["Orange"][0] = orig_b_row0
+
+    def apply_d_move(self, is_prime=False):
+        orig_f_row2 = list(self.state["Green"][2])
+        orig_r_row2 = list(self.state["Red"][2])
+        orig_b_row2 = list(self.state["Blue"][2])
+        orig_l_row2 = list(self.state["Orange"][2])
+
+        if not is_prime:
+            self.state["Green"][2] = orig_l_row2
+            self.state["Red"][2] = orig_f_row2
+            self.state["Blue"][2] = orig_r_row2
+            self.state["Orange"][2] = orig_b_row2
+        else:
+            self.state["Green"][2] = orig_r_row2
+            self.state["Orange"][2] = orig_f_row2
+            self.state["Blue"][2] = orig_l_row2
+            self.state["Red"][2] = orig_b_row2
+
+    # --- SLICE MOVES ---
+    def apply_e_move(self, is_prime=False):
+        """E Move: Middle horizontal slice rotates along with D' direction."""
+        orig_f_r1 = list(self.state["Green"][1])
+        orig_r_r1 = list(self.state["Red"][1])
+        orig_b_r1 = list(self.state["Blue"][1])
+        orig_l_r1 = list(self.state["Orange"][1])
+
+        if not is_prime:
+            self.state["Green"][1] = orig_l_r1
+            self.state["Red"][1] = orig_f_r1
+            self.state["Blue"][1] = orig_r_r1
+            self.state["Orange"][1] = orig_b_r1
+        else:
+            self.state["Green"][1] = orig_r_r1
+            self.state["Orange"][1] = orig_f_r1
+            self.state["Blue"][1] = orig_l_r1
+            self.state["Red"][1] = orig_b_r1
+
+    def apply_m_move(self, is_prime=False):
+        """M Move: Middle vertical slice rotates along with L direction."""
+        orig_u_c1 = [self.state["White"][r][1] for r in range(3)]
+        orig_f_c1 = [self.state["Green"][r][1] for r in range(3)]
+        orig_d_c1 = [self.state["Yellow"][r][1] for r in range(3)]
+        orig_b_c1 = [self.state["Blue"][r][1] for r in range(3)]
+
+        if not is_prime:
+            for r in range(3):
+                self.state["Green"][r][1] = orig_u_c1[r]
+                self.state["Yellow"][r][1] = orig_f_c1[r]
+                self.state["Blue"][r][1] = orig_d_c1[2 - r]
+                self.state["White"][r][1] = orig_b_c1[2 - r]
+        else:
+            for r in range(3):
+                self.state["Green"][r][1] = orig_d_c1[r]
+                self.state["White"][r][1] = orig_f_c1[r]
+                self.state["Blue"][r][1] = orig_u_c1[2 - r]
+                self.state["Yellow"][r][1] = orig_b_c1[2 - r]
+
+    # --- DETECTION LOGIC ---
+    def detect_face_movement(self, detected_grid):
+        """
+        Differentiates between Whole-Cube Rotations (x, y, z) and
+        Slice Moves (M, E) by comparing the full 3x3 camera grid
+        against predicted state transformations.
+        """
+        for row in detected_grid:
+            if "Unknown" in row:
+                return None
+
+        # 1. PREDICT WHOLE CUBE ROTATIONS
+        predicted_x = self.state["Yellow"]
+        predicted_x_prime = self.state["White"]
+        predicted_y = self.state["Orange"]
+        predicted_y_prime = self.state["Red"]
+        predicted_z = self.rotate_matrix_cw(self.state["Green"])
+        predicted_z_prime = self.rotate_matrix_ccw(self.state["Green"])
+
+        if detected_grid == predicted_x:
+            self.apply_x_move(is_prime=False)
+            return "x"
+        elif detected_grid == predicted_x_prime:
+            self.apply_x_move(is_prime=True)
+            return "x'"
+        elif detected_grid == predicted_y:
+            self.apply_y_move(is_prime=False)
+            return "y"
+        elif detected_grid == predicted_y_prime:
+            self.apply_y_move(is_prime=True)
+            return "y'"
+        # elif detected_grid == predicted_z:
+        #     self.apply_z_move(is_prime=False)
+        #     return "z"
+        # elif detected_grid == predicted_z_prime:
+        #     self.apply_z_move(is_prime=True)
+        #     return "z'"
+
+        # 2. PREDICT SLICE MOVES
+        predicted_e = [
+            self.state["Green"][0],
+            self.state["Orange"][1],
+            self.state["Green"][2],
+        ]
+        predicted_e_prime = [
+            self.state["Green"][0],
+            self.state["Red"][1],
+            self.state["Green"][2],
+        ]
+
+        predicted_m = [
+            [
+                self.state["Green"][0][0],
+                self.state["White"][0][1],
+                self.state["Green"][0][2],
+            ],
+            [
+                self.state["Green"][1][0],
+                self.state["White"][1][1],
+                self.state["Green"][1][2],
+            ],
+            [
+                self.state["Green"][2][0],
+                self.state["White"][2][1],
+                self.state["Green"][2][2],
+            ],
+        ]
+        predicted_m_prime = [
+            [
+                self.state["Green"][0][0],
+                self.state["Yellow"][0][1],
+                self.state["Green"][0][2],
+            ],
+            [
+                self.state["Green"][1][0],
+                self.state["Yellow"][1][1],
+                self.state["Green"][1][2],
+            ],
+            [
+                self.state["Green"][2][0],
+                self.state["Yellow"][2][1],
+                self.state["Green"][2][2],
+            ],
+        ]
+
+        if detected_grid == predicted_e:
+            self.apply_e_move(is_prime=False)
+            return "E"
+        elif detected_grid == predicted_e_prime:
+            self.apply_e_move(is_prime=True)
+            return "E'"
+        elif detected_grid == predicted_m:
+            self.apply_m_move(is_prime=False)
+            return "M"
+        elif detected_grid == predicted_m_prime:
+            self.apply_m_move(is_prime=True)
+            return "M'"
+
+        return None
+
+    def process_green_face_scan(self, detected_grid):
+        # First check if a full rotation or slice move occurred
+        move = self.detect_face_movement(detected_grid)
+        if move:
+            self.last_move_detected = f"Move Detected: {move}"
+            self.move_history.append(move)
+            print(f"[MOVE CONFIRMED] {self.last_move_detected}")
+            self.broadcast_state()
+            return
+
+        # Ensure we are looking at the front face before evaluating single outer layer moves
+        if detected_grid[1][1] != self.active_camera_face:
+            return
+
+        stored_green = self.state["Green"]
+
+        col0_detected = [detected_grid[r][0] for r in range(3)]
+        col0_stored = [stored_green[r][0] for r in range(3)]
+        col2_detected = [detected_grid[r][2] for r in range(3)]
+        col2_stored = [stored_green[r][2] for r in range(3)]
+
+        row0_detected = list(detected_grid[0])
+        row0_stored = list(stored_green[0])
+        row2_detected = list(detected_grid[2])
+        row2_stored = list(stored_green[2])
+
+        col0_changed = col0_detected != col0_stored and "Unknown" not in col0_detected
+        col2_changed = col2_detected != col2_stored and "Unknown" not in col2_detected
+        row0_changed = row0_detected != row0_stored and "Unknown" not in row0_detected
+        row2_changed = row2_detected != row2_stored and "Unknown" not in row2_detected
+
+        # Dynamic Reference Lookups
+        up_col0 = self.state["White"][0][0]
+        down_col0 = self.state["Yellow"][0][0]
+        up_col2 = self.state["White"][0][2]
+        down_col2 = self.state["Yellow"][0][2]
+
+        left_row0 = self.state["Orange"][0][0]
+        right_row0 = self.state["Red"][0][0]
+        left_row2 = self.state["Orange"][2][0]
+        right_row2 = self.state["Red"][2][0]
+
+        detected_move = None
+
+        # --- TOP ROW (U MOVES) ---
+        if row0_changed and not row2_changed:
+            incoming_color = row0_detected[1]
+            if incoming_color == right_row0:
+                detected_move = "U"
+                self.apply_u_move(is_prime=False)
+            elif incoming_color == left_row0:
+                detected_move = "U'"
+                self.apply_u_move(is_prime=True)
+
+        # --- BOTTOM ROW (D MOVES) ---
+        elif row2_changed and not row0_changed:
+            incoming_color = row2_detected[1]
+            if incoming_color == right_row2:
+                detected_move = "D'"
+                self.apply_d_move(is_prime=True)
+            elif incoming_color == left_row2:
+                detected_move = "D"
+                self.apply_d_move(is_prime=False)
+
+        # --- LEFT COLUMN (L MOVES) ---
+        elif col0_changed and not col2_changed:
+            incoming_color = col0_detected[1]
+            if incoming_color == down_col0:
+                detected_move = "L"
+                self.apply_l_move(is_prime=False)
+            elif incoming_color == up_col0:
+                detected_move = "L'"
+                self.apply_l_move(is_prime=True)
+
+        # --- RIGHT COLUMN (R MOVES) ---
+        elif col2_changed and not col0_changed:
+            incoming_color = col2_detected[1]
+            if incoming_color == up_col2:
+                detected_move = "R"
+                self.apply_r_move(is_prime=False)
+            elif incoming_color == down_col2:
+                detected_move = "R'"
+                self.apply_r_move(is_prime=True)
+
+        if detected_move:
+            self.last_move_detected = f"Move Detected: {detected_move}"
+            self.move_history.append(detected_move)
+            print(f"[MOVE CONFIRMED] {self.last_move_detected}")
+            self.broadcast_state()
+
+
+def get_color_from_patch(hsv_patch):
+    total_pixels = hsv_patch.shape[0] * hsv_patch.shape[1]
+    if total_pixels == 0:
+        return "Unknown"
+
+    best_color = "Unknown"
+    max_match_pct = 0.0
+
+    for col_name, ranges in COLOR_RANGES_HSV.items():
+        mask = np.zeros(hsv_patch.shape[:2], dtype=np.uint8)
+        for lower, upper in ranges:
+            mask = cv2.bitwise_or(
+                mask, cv2.inRange(hsv_patch, np.array(lower), np.array(upper))
+            )
+
+        match_pct = cv2.countNonZero(mask) / total_pixels
+        if match_pct > max_match_pct and match_pct > 0.15:
+            max_match_pct = match_pct
+            best_color = col_name
+
+    return best_color
+
+
+def extract_facelet_grid(frame, quad_pts, warp_size=240):
+    dst_pts = np.float32(
+        [[0, 0], [warp_size, 0], [warp_size, warp_size], [0, warp_size]]
+    )
+    M = cv2.getPerspectiveTransform(quad_pts.astype(np.float32), dst_pts)
+    flat_face = cv2.warpPerspective(frame, M, (warp_size, warp_size))
+    hsv_face = cv2.cvtColor(flat_face, cv2.COLOR_BGR2HSV)
+
+    cell_size = warp_size // 3
+    margin = int(cell_size * 0.35)
+
+    grid = [["Unknown"] * 3 for _ in range(3)]
+
+    for r in range(3):
+        for c in range(3):
+            x_start, y_start = c * cell_size, r * cell_size
+            hsv_patch = hsv_face[
+                y_start + margin : y_start + cell_size - margin,
+                x_start + margin : x_start + cell_size - margin,
+            ]
+            grid[r][c] = get_color_from_patch(hsv_patch)
+
+    return grid
+
+
+# --- EMBEDDED WEB PAGE FOR 3D VISUALIZATION ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>3D Rubik's Cube Viewer</title>
+    <style>
+        body { margin: 0; background: #111; color: #fff; font-family: sans-serif; overflow: hidden; }
+        #hud { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.8); padding: 15px; border-radius: 8px; z-index: 10; }
+        #canvas { width: 100vw; height: 100vh; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+    <div id="hud">
+        <h2>Live 3D Cube State</h2>
+        <p>Active Face: <b id="active">-</b></p>
+        <p>Status: <span id="status">Connecting...</span></p>
+    </div>
+    <div id="canvas"></div>
+    <script>
+        const socket = io();
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x111111);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(5, 5, 7);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.getElementById('canvas').appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        const COLOR_MAP = {
+            'White': 0xffffff, 'Yellow': 0xffff00,
+            'Green': 0x00ff00, 'Blue': 0x0000ff,
+            'Orange': 0xffa500, 'Red': 0xff0000,
+            'Unknown': 0x222222
+        };
+
+        let cubies = [];
+
+        function createCube() {
+            const size = 0.95;
+            const geometry = new THREE.BoxGeometry(size, size, size);
+
+            for (let x = -1; x <= 1; x++) {
+                for (let y = -1; y <= 1; y++) {
+                    for (let z = -1; z <= 1; z++) {
+                        if (x === 0 && y === 0 && z === 0) continue;
+                        const materials = Array(6).fill().map(() => new THREE.MeshBasicMaterial({ color: 0x111111 }));
+                        const mesh = new THREE.Mesh(geometry, materials);
+                        mesh.position.set(x, y, z);
+                        scene.add(mesh);
+                        cubies.push({ mesh, x, y, z });
+                    }
+                }
+            }
+        }
+
+        function update3DCube(faces) {
+            cubies.forEach(cubie => {
+                const { mesh, x, y, z } = cubie;
+                const mats = mesh.material;
+                if (x === 1) mats[0].color.setHex(COLOR_MAP[faces.Red[1 - y][z + 1]] || 0x222222);
+                if (x === -1) mats[1].color.setHex(COLOR_MAP[faces.Orange[1 - y][1 - z]] || 0x222222);
+                if (y === 1) mats[2].color.setHex(COLOR_MAP[faces.White[1 - z][x + 1]] || 0x222222);
+                if (y === -1) mats[3].color.setHex(COLOR_MAP[faces.Yellow[z + 1][x + 1]] || 0x222222);
+                if (z === 1) mats[4].color.setHex(COLOR_MAP[faces.Green[1 - y][x + 1]] || 0x222222);
+                if (z === -1) mats[5].color.setHex(COLOR_MAP[faces.Blue[1 - y][2 - (x + 1)]] || 0x222222);
+            });
+        }
+
+        createCube();
+
+        socket.on('cube_update', (data) => {
+            document.getElementById('active').innerText = data.active_center || 'None';
+            document.getElementById('status').innerText = data.status || 'Active';
+            if (data.faces) update3DCube(data.faces);
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+
+@socketio.on("connect")
+def handle_connect():
+    cube_tracker.broadcast_state()
+
+
+def run_server():
+    socketio.run(app, host="0.0.0.0", port=5001, debug=False, use_reloader=False)
+
+
+# Global cube instance
+cube_tracker = RubiksCubeTracker()
+
+
+def main():
+    # Start web server in background thread
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+    print("\n[3D VIEWER READY] Open http://localhost:5001 in your browser.\n")
+
+    last_process_time = 0.0
+    process_interval = 0.20
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1)
+        h_frame, w_frame, _ = frame.shape
+        display_frame = frame.copy()
+
+        results = model(frame, conf=0.40, verbose=False)[0]
+        quad_corners = None
+
+        if results.masks is not None and len(results.masks) > 0:
+            masks = results.masks.data.cpu().numpy()
+            boxes = results.boxes.xyxy.cpu().numpy().astype(int)
+            best_idx = np.argmax([(b[2] - b[0]) * (b[3] - b[1]) for b in boxes])
+
+            mask_resized = cv2.resize(masks[best_idx], (w_frame, h_frame))
+            mask_binary = (mask_resized > 0.5).astype(np.uint8) * 255
+
+            contours, _ = cv2.findContours(
+                mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            if contours:
+                cnt = max(contours, key=cv2.contourArea)
+                peri = cv2.arcLength(cnt, True)
+                approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
+                pts = (
+                    approx.reshape(4, 2)
+                    if len(approx) == 4
+                    else cv2.boxPoints(cv2.minAreaRect(cnt))
+                )
+
+                s = pts.sum(axis=1)
+                diff = np.diff(pts, axis=1)
+                rect = np.zeros((4, 2), dtype="float32")
+                rect[0] = pts[np.argmin(s)]
+                rect[2] = pts[np.argmax(s)]
+                rect[1] = pts[np.argmin(diff)]
+                rect[3] = pts[np.argmax(diff)]
+                quad_corners = rect
+
+                cv2.polylines(
+                    display_frame,
+                    [quad_corners.astype(np.int32)],
+                    True,
+                    (0, 255, 0),
+                    2,
+                )
+
+        now = time.time()
+        if quad_corners is not None and (now - last_process_time) > process_interval:
+            last_process_time = now
+            current_grid = extract_facelet_grid(frame, quad_corners)
+            cube_tracker.process_green_face_scan(current_grid)
+
+        # On-Screen HUD Overlay
+        cv2.putText(
+            display_frame,
+            f"Focused Face: {cube_tracker.active_camera_face}",
+            (20, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
+        cv2.putText(
+            display_frame,
+            f"{cube_tracker.last_move_detected}",
+            (20, 70),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 0),
+            2,
+        )
+        cv2.putText(
+            display_frame,
+            f"History: {' '.join(cube_tracker.move_history[-10:])}",
+            (20, 105),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 0, 0),
+            1,
+        )
+        cv2.putText(
+            display_frame,
+            "Press 'r' to Reset | Press 'q' to Quit",
+            (20, h_frame - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 0),
+            1,
+        )
+
+        cv2.imshow("Rubik's Move Logger", display_frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        elif key == ord("r"):
+            cube_tracker.reset_to_solved()
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

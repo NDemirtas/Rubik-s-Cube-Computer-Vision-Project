@@ -1,0 +1,6 @@
+from roboflow import Roboflow
+rf = Roboflow(api_key="7EdWUUZ4KVSWAQSdLDzn")
+project = rf.workspace("yolorobo-czktx").project("cube-hao5o")
+version = project.version(5)
+dataset = version.download("yolov8")
+                
