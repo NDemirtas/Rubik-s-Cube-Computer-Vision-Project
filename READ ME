@@ -1,0 +1,12 @@
+This repository contains all the versions of the Rubik's Cube Solve Tracking system.
+It also contains the testing software for the system.
+
+To run the system, download the most recent YOLO model weights and the cube_tracker_V63.py file. This is the most recent version of 
+the tracking system.
+
+Open the cube_tracker file in terminal. You may be required to install various libraries such as numpy, OpenCV, and ultralytics.
+Once all are installed, the tracker can be run. Make sure that the installed libraries, YOLO weights, and cube_tracker file
+are in the same folder and the terminal is running within that folder
+
+To run the testing files, install both the cube_lab_new.py and the atp_runner_new.py files. Make sure they are in the same folder as
+the other installed files. Run the files to test the various systems.
