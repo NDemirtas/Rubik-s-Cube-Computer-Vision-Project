@@ -1,0 +1,77 @@
+{
+  "frames_per_face": 50,
+  "capture_every": 3,
+  "calibrate_per_condition": true,
+  "conditions": [
+    {
+      "name": "normal",
+      "on": true,
+      "settings": {}
+    },
+    {
+      "name": "bright",
+      "on": true,
+      "settings": {
+        "brightness": 60
+      }
+    },
+    {
+      "name": "dim",
+      "on": true,
+      "settings": {
+        "brightness": -60
+      }
+    },
+    {
+      "name": "warm light",
+      "on": true,
+      "settings": {
+        "temperature": 60
+      }
+    },
+    {
+      "name": "cool light",
+      "on": true,
+      "settings": {
+        "temperature": -60
+      }
+    },
+    {
+      "name": "glare",
+      "on": true,
+      "settings": {
+        "glare": 0.6
+      }
+    },
+    {
+      "name": "fingers",
+      "on": true,
+      "settings": {
+        "fingers": 4
+      }
+    },
+    {
+      "name": "fast turns (blur)",
+      "on": true,
+      "settings": {
+        "motion_blur": 20
+      }
+    },
+    {
+      "name": "washed out",
+      "on": false,
+      "settings": {
+        "desaturate": 0.4,
+        "contrast": 0.7
+      }
+    },
+    {
+      "name": "dark + noisy",
+      "on": false,
+      "settings": {
+        "brightness": -50,
+        "noise": 15
+      }
+    }
+  ]
+}

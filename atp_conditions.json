@@ -1,0 +1,142 @@
+{
+ "_help": "Edit freely. atp = which ATP the row counts for. Settings: temperature (+warm/-cool), brightness (+-), contrast (x), gain (x, <1 darker), noise (sigma), glare (0-1), resolution (image height), jpeg (quality 5-95), fps (camera rate), scale (<1 further, >1 closer), tilt (degrees), clutter (number of objects). on=false skips a row.",
+ "recalibrate_lighting": true,
+ "conditions": [
+  {
+   "atp": "ATP-02",
+   "name": "as recorded",
+   "settings": {}
+  },
+  {
+   "atp": "ATP-04",
+   "name": "warm light",
+   "settings": {
+    "temperature": 45
+   }
+  },
+  {
+   "atp": "ATP-04",
+   "name": "cool light",
+   "settings": {
+    "temperature": -45
+   }
+  },
+  {
+   "atp": "ATP-04",
+   "name": "bright / sunlit",
+   "settings": {
+    "brightness": 50,
+    "contrast": 1.25,
+    "temperature": 12
+   }
+  },
+  {
+   "atp": "ATP-04",
+   "name": "dim",
+   "settings": {
+    "gain": 0.5,
+    "noise": 5
+   }
+  },
+  {
+   "atp": "ATP-04",
+   "name": "dark + noisy",
+   "settings": {
+    "gain": 0.3,
+    "noise": 12
+   }
+  },
+  {
+   "atp": "ATP-04",
+   "name": "glare",
+   "settings": {
+    "glare": 0.7
+   }
+  },
+  {
+   "atp": "ATP-05",
+   "name": "480p webcam",
+   "settings": {
+    "resolution": 480
+   }
+  },
+  {
+   "atp": "ATP-05",
+   "name": "360p compressed",
+   "settings": {
+    "resolution": 360,
+    "jpeg": 30
+   }
+  },
+  {
+   "atp": "ATP-05",
+   "name": "noisy sensor",
+   "settings": {
+    "noise": 10
+   }
+  },
+  {
+   "atp": "ATP-05",
+   "name": "15 fps camera",
+   "settings": {
+    "fps": 15
+   }
+  },
+  {
+   "atp": "ATP-06",
+   "name": "far (60%)",
+   "settings": {
+    "scale": 0.6
+   }
+  },
+  {
+   "atp": "ATP-06",
+   "name": "very far (45%)",
+   "settings": {
+    "scale": 0.45
+   }
+  },
+  {
+   "atp": "ATP-06",
+   "name": "close (140%)",
+   "settings": {
+    "scale": 1.4
+   }
+  },
+  {
+   "atp": "ATP-06",
+   "name": "tilted 20 deg",
+   "settings": {
+    "tilt": 20
+   }
+  },
+  {
+   "atp": "ATP-06",
+   "name": "tilted 35 deg",
+   "settings": {
+    "tilt": 35
+   }
+  },
+  {
+   "atp": "ATP-03",
+   "name": "low clutter",
+   "settings": {
+    "clutter": 8
+   }
+  },
+  {
+   "atp": "ATP-03",
+   "name": "medium clutter",
+   "settings": {
+    "clutter": 20
+   }
+  },
+  {
+   "atp": "ATP-03",
+   "name": "high clutter",
+   "settings": {
+    "clutter": 45
+   }
+  }
+ ]
+}

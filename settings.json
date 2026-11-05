@@ -1,0 +1,22 @@
+{
+ "tracking_max_hz": 12.0,
+ "threaded_tracking": true,
+ "face_finder": "hybrid",
+ "state_lock": false,
+ "robust_corner_order": true,
+ "auto_record": true,
+ "max_record_seconds": 180,
+ "record_jpeg_quality": 92,
+ "timer_hold_seconds": 0.5,
+ "lighting_check": true,
+ "remember_camera_mode": false,
+ "zoom": 1.562,
+ "zoom_center": [
+  0.5,
+  0.5
+ ],
+ "max_zoom": 4.0,
+ "assume_last_hidden_turn": true,
+ "player": "Me",
+ "videos_folder": "recordings"
+}
